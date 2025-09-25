@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Asistente de Ecolite</title>
+  <link rel="stylesheet" href="/static/chatbox.css">
+</head>
+<body>
+  <button class="cb-fab" id="cbFab" aria-label="Abrir chat">
+    <span class="pulse"></span><span>¿Necesitas ayuda?</span>
+  </button>
+
+  <section class="cb-panel" id="cbPanel" role="dialog" aria-label="Asistente de Ecolite">
+    <header class="cb-header">
+      <div class="cb-logo"></div>
+      <div>
+        <p class="cb-title">Asistente de Ecolite</p>
+        <p class="cb-sub">Atención rápida y personalizada</p>
+      </div>
+      <button id="cbClose" class="cb-close">✕</button>
+    </header>
+
+    <div class="cb-body">
+      <div class="cb-stream" id="cbStream"></div>
+      <footer class="cb-footer">
+        <input id="cbInput" class="cb-input" placeholder="Escribe tu mensaje…"/>
+        <button id="cbSend" class="cb-send">Enviar</button>
+      </footer>
+    </div>
+  </section>
+
+  <!-- Template del botón “Ver más” -->
+  <template id="tplShowMore">
+    <div class="msg">
+      <div class="bubble">
+        <button class="cb-cta" type="button" aria-label="Ver más resultados" data-context="">
+          Ver más
+        </button>
+      </div>
+    </div>
+  </template>
+
+  <script src="/static/chatbox.js"></script>
+</body>
+</html>
