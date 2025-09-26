@@ -111,37 +111,35 @@ async function sendMessage(raw, isShowMore = false) {
   input.value = "";
   typing(true);
 
-    try {
-      const res = await fetch("/chat/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, message: effectiveQuery, last_query: lastQuery, page })
-      });
+  try {
+    const res = await fetch("/chat/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, message: effectiveQuery, last_query: lastQuery, page })
+    });
 
-      // Lee cuerpo como texto primero (para mensajes de error no-JSON)
-      const raw = await res.text();
-      let data = null;
-      try { data = raw ? JSON.parse(raw) : null; } catch { /* no JSON */ }
+    const raw = await res.text();
+    let data = null; try { data = raw ? JSON.parse(raw) : null; } catch {}
 
-      if (!res.ok) {
-        typing(false);
-        const detail = (data && (data.detail || data.error || data.message)) || raw || "";
-        console.error("Error /chat/:", res.status, detail);
-        pushBot(`⚠️ Error del servidor (${res.status}). ${detail ? "Detalle: " + escapeHtml(String(detail)).slice(0, 240) : "Intenta de nuevo."}`);
-        return;
-      }
-
+    if (!res.ok) {
       typing(false);
-      const text = (data && (data.content || data.reply)) || "Aquí tienes algunas opciones recomendadas:";
-      const products = Array.isArray(data?.products) ? data.products : [];
-      pushBot(text, products);
-
-    } catch (e) {
-      typing(false);
-      console.error("Network error /chat/:", e);
-      pushBot("⚠️ No me pude conectar, intenta de nuevo.");
+      const detail = (data && (data.detail || data.error || data.message)) || raw || "";
+      console.error("Error /chat/:", res.status, detail);
+      pushBot(`⚠️ Error del servidor (${res.status}). ${detail ? "Detalle: " + escapeHtml(String(detail)).slice(0, 240) : "Intenta de nuevo."}`);
+      return;
     }
+
+    typing(false);
+    const text = (data && (data.content || data.reply)) || "Aquí tienes algunas opciones recomendadas:";
+    const products = Array.isArray(data?.products) ? data.products : [];
+    pushBot(text, products);
+
+  } catch (e) {
+    typing(false);
+    console.error("Network error /chat/:", e);
+    pushBot("⚠️ No me pude conectar, intenta de nuevo.");
   }
+}
 
 sendBtn.addEventListener('click', () => sendMessage());
 input.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });

@@ -33,6 +33,7 @@ def chat(in_: ChatIn):
     page = max(0, int(in_.page or 0))
     effective_query = in_.last_query if page > 0 and in_.last_query else msg
 
+    # Estado efímero solo para ranking (STATeless)
     state = {
         "page": page,
         "result_seed": _stable_seed(in_.session_id, effective_query),

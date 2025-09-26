@@ -4,15 +4,19 @@ import os, json, unicodedata, re
 from pathlib import Path
 from typing import Dict, Tuple, List
 
+# 1) Variable de entorno (recomendada)
 ENV_PATH = os.getenv("ECOLITE_PRODUCTS_PATH")
+
+# 2) Fallbacks conocidos
 DEFAULT_PATHS = [
-    Path(__file__).parent.parent / "data" / "productos.json",
-    Path(__file__).parent.parent.parent / "productos.json",
+    Path(__file__).parent.parent / "data" / "productos.json",   # backend/data/productos.json
+    Path(__file__).parent.parent.parent / "productos.json",     # ./productos.json (raíz)
 ]
 
 DATA_PATH: Path | None = None
 PRODUCTOS: Dict[str, dict] = {}
 
+# ----------------- Normalización -----------------
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c) != "Mn")
 
@@ -23,6 +27,7 @@ def norm_txt(s: str) -> str:
 
 def tok(s: str) -> List[str]:
     s = norm_txt(s)
+    # separa 3000k/ip65/12v con seguridad
     s = re.sub(r"([0-9]+)([a-z]+)", r"\1 \2", s)
     s = re.sub(r"([a-z]+)([0-9]+)", r"\1 \2", s)
     parts = re.split(r"[^a-z0-9]+", s)
@@ -31,16 +36,13 @@ def tok(s: str) -> List[str]:
 def url_slug_tokens(url: str | None) -> List[str]:
     if not url:
         return []
-    try:
-        path = re.sub(r"^https?://[^/]+", "", url or "")
-        segs = [seg for seg in path.split("/") if seg]
-        toks: List[str] = []
-        for seg in segs:
-            toks.extend(tok(seg.replace("-", " ")))
-        return toks
-    except Exception:
-        return []
+    path = re.sub(r"^https?://[^/]+", "", url or "")
+    toks: List[str] = []
+    for seg in [seg for seg in path.split("/") if seg]:
+        toks.extend(tok(seg.replace("-", " ")))
+    return toks
 
+# ----------------- Carga catálogo -----------------
 def _resolve_path() -> Path:
     global DATA_PATH
     if DATA_PATH:
@@ -52,11 +54,14 @@ def _resolve_path() -> Path:
         if p.exists():
             DATA_PATH = p
             return DATA_PATH
+    # último intento: junto a este módulo (útil si copiaste el JSON aquí)
     fallback = Path(__file__).parent / "productos.json"
     if fallback.exists():
         DATA_PATH = fallback
         return DATA_PATH
-    raise FileNotFoundError("No se encontró productos.json. Usa ECOLITE_PRODUCTS_PATH o colócalo en backend/data/ o en la raíz.")
+    raise FileNotFoundError(
+        "No se encontró productos.json. Configura ECOLITE_PRODUCTS_PATH o colócalo en backend/data/ o en la raíz del repo."
+    )
 
 def _postprocess_record(rec: dict) -> dict:
     name = rec.get("name") or ""
@@ -89,6 +94,7 @@ def _load_from_disk() -> Dict[str, dict]:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    # admite dict {CODE:{...}} o lista [{...}]
     if isinstance(raw, list):
         data = {str(it.get("code") or it.get("sku") or f"ITEM{i}"): it for i, it in enumerate(raw)}
     else:

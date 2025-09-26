@@ -32,16 +32,21 @@ _INDEX_READY = False
 _INDEX: Dict[str, Dict[str, Set[str]]] = {}
 _VOCAB: Dict[str, int] = {}
 _IDF: Dict[str, float] = {}
-_ALL_CATEGORY_TERMS: Set[str] = set()
+
+def reset_index():
+    """Permite reconstruir el índice tras reload del catálogo."""
+    global _INDEX_READY, _INDEX, _VOCAB, _IDF
+    _INDEX_READY = False
+    _INDEX.clear(); _VOCAB.clear(); _IDF.clear()
 
 def _ensure_index():
-    global _INDEX_READY, _INDEX, _VOCAB, _IDF, _ALL_CATEGORY_TERMS, PRODUCTOS
+    global _INDEX_READY, _INDEX, _VOCAB, _IDF, PRODUCTOS
     if _INDEX_READY:
         return
     if not PRODUCTOS:
         load_products()
 
-    _INDEX.clear(); _VOCAB.clear(); _ALL_CATEGORY_TERMS.clear()
+    _INDEX.clear(); _VOCAB.clear()
 
     for code, p in PRODUCTOS.items():
         name = set(_tok(p.get("name_norm") or p.get("name") or ""))
@@ -61,7 +66,6 @@ def _ensure_index():
         _INDEX[code] = {"name": name, "tags": tags, "cats": cats, "slug": slug, "code": codef, "blob": blob}
         for t in set().union(name, tags, cats, slug, codef, blob):
             _VOCAB[t] = _VOCAB.get(t, 0) + 1
-        _ALL_CATEGORY_TERMS |= cats
 
     N = max(1, len(_INDEX))
     _IDF.update({t: math.log((N + 1) / (df + 0.5)) + 1.0 for t, df in _VOCAB.items()})
@@ -80,17 +84,46 @@ def _char_sim(a: str, b: str) -> float:
         return 0.0
     return len(A & B) / len(A | B)
 
+# ----------- Morfología simple (ES) data-driven -----------
+def _morph_variants(tok: str) -> List[str]:
+    """Devuelve variantes singular/plural SI existen en el vocabulario."""
+    out = [tok]
+    # reglas genéricas y seguras
+    cand = []
+    if tok.endswith("es") and len(tok) > 3:
+        cand.append(tok[:-2])          # paneles -> panel
+    if tok.endswith("s") and len(tok) > 3:
+        cand.append(tok[:-1])          # leds -> led
+    if tok.endswith("ces") and len(tok) > 3:
+        cand.append(tok[:-3] + "z")    # luces -> luz
+    if tok.endswith("iones") and len(tok) > 5:
+        cand.append(tok[:-5] + "ion")  # instalaciones -> instalacion
+
+    for c in cand:
+        if c in _VOCAB and c not in out:
+            out.append(c)
+    return out
+
 def _expand_query_tokens(q_toks: List[str], k_fallback: int = 6) -> List[str]:
     _ensure_index()
     base = [t for t in q_toks if t not in _STOPWORDS_ES]
     if not base:
         return []
-    cand: Dict[str, float] = {}
+
+    # morfología: añade variantes presentes en el vocab
+    morph: Set[str] = set()
     for t in base:
+        for v in _morph_variants(t):
+            morph.add(v)
+
+    # similitud de caracteres sobre vocab
+    cand: Dict[str, float] = {}
+    for t in base + list(morph):
         for v in _VOCAB.keys():
             sim = _char_sim(t, v)
             if sim >= 0.35:
                 cand[v] = max(cand.get(v, 0.0), sim)
+
     return sorted(cand.keys(), key=lambda x: (-cand[x], -_idf(x)))[:k_fallback]
 
 def _score_product(code: str, q_toks: List[str], expand: List[str]) -> float:
@@ -133,7 +166,8 @@ def search_candidates(user_msg: str, state: dict, limit: int = 5, offset: int = 
     _ensure_index()
     text = _norm(user_msg)
     q_toks = _tok(text)
-    if not [t for t in q_toks if t not in _STOPWORDS_ES]:
+    useful = [t for t in q_toks if t not in _STOPWORDS_ES]
+    if not useful:
         return []
 
     expand = _expand_query_tokens(q_toks)
@@ -150,16 +184,20 @@ def search_candidates(user_msg: str, state: dict, limit: int = 5, offset: int = 
 
     scored.sort(key=lambda x: (-x[0], x[1]["code"]))
     flattened = [it for _, it in scored]
-    return _paginate(flattened, limit=limit, offset=offset, exclude_codes=set(exclude_codes or []))
 
-def _detect_categories_from_text(user_msg: str) -> List[str]:
-    _ensure_index()
-    msg = _norm(user_msg)
-    toks = set(_tok(user_msg))
-    detected: Set[str] = set()
-    for term in _ALL_CATEGORY_TERMS:
-        if term in msg or any(term in t or t in term for t in toks):
-            detected.add(term)
-            if len(detected) >= 6:
-                break
-    return list(detected)
+    # ---- Fallback de RECALL si no hay resultados (fuzzy global sobre blob) ----
+    if not flattened:
+        q_str = " ".join(useful)
+        def broad_score(pcode: str) -> float:
+            blob = " ".join(_INDEX[pcode]["blob"]) if isinstance(_INDEX[pcode]["blob"], set) else " ".join(list(_INDEX[pcode]["blob"]))
+            return _char_sim(q_str, blob)
+        broad = []
+        for code, p in PRODUCTOS.items():
+            bs = broad_score(code)
+            if bs >= 0.12:  # umbral suave
+                payload = {"code": code, "name": p.get("name"), "price": p.get("price"), "url": p.get("url"), "img_url": p.get("img_url")}
+                broad.append((bs, payload))
+        broad.sort(key=lambda x: (-x[0], x[1]["code"]))
+        flattened = [it for _, it in broad]
+
+    return _paginate(flattened, limit=limit, offset=offset, exclude_codes=set(exclude_codes or []))
