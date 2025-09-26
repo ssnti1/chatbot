@@ -1,3 +1,2274 @@
+chat py:
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from backend.services.state_manager import (
+    get_state, update_state, maybe_extract_slots,
+    classify_intent, is_keyword_signal, Intent
+)
+from backend.services.search_service import search_candidates, _detect_categories_from_text, is_offtopic
+from backend.services.context_builder import build_context
+from backend.services.openai_client import ask_chatgpt
+from backend.routers import faq
+import random
+import re as _re 
+
+
+_TALK_RE = _re.compile(r"^\s*(hablemos|hablamos|quiero\s+que\s+hablemos|quiero\s+hablar)\s+de\b", _re.I)
+
+def _is_talk_request(text: str) -> bool:
+    return bool(_TALK_RE.search(text or ""))
+
+def _talk_small_reply() -> str:
+    return (
+        "¡Perfecto! Hablemos de iluminación 💡. "
+        "Para guiarte mejor, dime: ¿qué espacio quieres iluminar (ej.: oficina, piscina, bodega, exterior) "
+        "o el tipo de luz (ej.: reflector 200W IP65, panel 60x60, tira 24V)?"
+    )
+
+def _is_catalog_request(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "catalogo" in t or "catálogo" in t or
+        _re.search(r'\b(ver|muestrame|mu[ée]strame|ense[ñn]ame)\s+el\s+cat[aá]logo\b', t) is not None
+    )
+
+def _catalog_link_reply() -> str:
+    import os as _os
+    url = _os.getenv("ECOLITE_CATALOGO_URL", "https://ecolite.com.co/catalogo")
+    return f"Aquí puedes ver nuestro catálogo: {url}"
+
+
+_MORE_PAT = _re.compile(
+    r"\b("
+    r"mas|más|"
+    r"otras?|siguientes?|siguiente|"
+    r"ver\s+mas|ver\s+más|"
+    r"mu[eé]strame\s+otras?"
+    r")\b",
+    flags=_re.IGNORECASE
+)
+
+def is_more_signal(msg: str) -> bool:
+    return bool(_MORE_PAT.search(msg or ""))
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+PER_PAGE = 5
+
+class ChatIn(BaseModel):
+    message: str
+    session_id: str = "default"
+
+GREETING_PROMPT = (
+    "Saluda breve en tono serio/amistoso; pregunta qué espacio desea iluminar "
+    "(oficina, piscina, bodega…)."
+)
+
+SMALLTALK_PROMPT = (
+    "Responde breve y ofrece ayuda. Pide 1–2 datos clave: espacio (oficina/piscina/bodega), "
+    "tipo (decorativa/riel/industrial) o presupuesto."
+)
+
+
+def _fetch_and_reply(user_msg: str, state: dict, session_id: str) -> dict:
+    """
+    Trae productos con offset/limit, marca vistos y arma la respuesta.
+    Devuelve también 'items' para que el front pinte cards.
+    """
+    seen = state.get("seen_codes", set())
+    page = state.get("page", 0)
+
+    offset = 0 if seen else page * PER_PAGE
+
+    items = search_candidates(
+        user_msg,
+        state,
+        limit=PER_PAGE,
+        offset=offset,
+        exclude_codes=seen
+    )
+
+    if not items:
+        state["result_seed"] = random.getrandbits(32)
+        items = search_candidates(
+            user_msg,
+            state,
+            limit=PER_PAGE,
+            offset=offset,
+            exclude_codes=seen
+        )
+
+    if not items:
+        reply = "No encontré productos para esa búsqueda. ¿Quieres que te sugiera otra categoría o revisar el catálogo completo?"
+        update_state(session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply, "items": []}
+
+    for it in items:
+        state.setdefault("seen_codes", set()).add(it["code"])
+
+    contexto = build_context(user_msg, state, items)
+    reply = ask_chatgpt(contexto, "Redacta breve y lista solo estos productos.")
+    update_state(session_id, {"role": "assistant", "content": reply})
+
+    return {"reply": reply, "items": items}
+
+
+@router.post("/")
+def chat(in_: ChatIn):
+    user_msg = (in_.message or "").strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    state = get_state(in_.session_id)
+    update_state(in_.session_id, {"role": "user", "content": user_msg})
+    state["last_user_msg"] = user_msg
+
+    if _is_catalog_request(user_msg):
+        reply = _catalog_link_reply()
+        state["last_intent"] = "catalog"
+        update_state(in_.session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply, "items": []}
+
+    if _is_talk_request(user_msg):
+        state["last_intent"] = "faq_or_smalltalk"
+        state["last_query"] = None
+        state["page"] = 0
+        reply = _talk_small_reply()
+        update_state(in_.session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply, "items": []}
+
+    if is_more_signal(user_msg):
+        if is_keyword_signal(user_msg):  
+            state["page"] = 0
+            state["last_query"] = user_msg
+            state["result_seed"] = random.getrandbits(32)
+            return _fetch_and_reply(user_msg, state, in_.session_id)
+
+        if state.get("last_query"):
+            state["page"] = state.get("page", 0) + 1
+            return _fetch_and_reply(state["last_query"], state, in_.session_id)
+        else:
+            reply = "Aún no tengo una lista para ‘mostrar más’. Dime qué buscas (p. ej., ‘lámparas decorativas’, ‘reflector 100W IP65’)."
+            update_state(in_.session_id, {"role": "assistant", "content": reply})
+            return {"reply": reply, "items": []}
+
+    maybe_extract_slots(state, user_msg)
+
+    early_intent: Intent = classify_intent(user_msg)
+    if early_intent == "greeting":
+        if is_keyword_signal(user_msg) or state.get("espacio_source") in {"alias", "direct"}:
+            intent = "product_search"
+        else:
+            state["last_intent"] = None
+            reply = ask_chatgpt(f"SOS SISTEMA: {GREETING_PROMPT}", user_msg)
+            update_state(in_.session_id, {"role": "assistant", "content": reply})
+            return {"reply": reply}
+    else:
+        intent = early_intent
+
+    try:
+        if intent == "product_search" and is_offtopic(user_msg):
+            intent = "faq_or_smalltalk"
+    except Exception:
+        pass
+
+    try:
+        if intent != "product_search" and is_offtopic(user_msg):
+            reply = (
+                "No tengo información sobre ese tema. "
+                "Puedo ayudarte con iluminación y productos Ecolite 💡. "
+                "Por ejemplo: ‘lámparas decorativas’, ‘paneles solares’."
+            )
+            update_state(in_.session_id, {"role": "assistant", "content": reply})
+            return {"reply": reply, "items": []}
+    except Exception:
+        pass
+
+    if intent == "faq_or_smalltalk":
+        low = user_msg.lower()
+        if any(w in low for w in ("sugiere", "sugiéreme", "sugiereme", "recomiéndame", "recomiendame", "recomienda")) and state.get("espacio"):
+            intent = "product_search"
+            user_msg = state["espacio"]
+
+    if intent == "greeting":
+        state["last_intent"] = None
+        reply = ask_chatgpt(f"SOS SISTEMA: {GREETING_PROMPT}", user_msg)
+        update_state(in_.session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply}
+
+    faq_reply = faq.try_answer(user_msg)
+    if faq_reply:
+        state["last_intent"] = "faq"
+        update_state(in_.session_id, {"role": "assistant", "content": faq_reply})
+        return {"reply": faq_reply}
+
+    if intent == "product_search":
+        state["last_intent"] = None
+        try:
+            from backend.services.state_manager import _detect_focuses_from_text
+            detected = _detect_focuses_from_text(user_msg)
+            if detected:
+                state["focus"] = set(detected)
+        except Exception:
+            pass
+
+        q = user_msg
+        if not is_keyword_signal(user_msg) and state.get("espacio"):
+            q = state["espacio"]
+
+        state["page"] = 0
+        state["last_query"] = q
+        state["result_seed"] = random.getrandbits(32)
+        return _fetch_and_reply(q, state, in_.session_id)
+
+    reply = "¿Quieres que te sugiera algo del catálogo o prefieres resolver otra duda (ej.: garantía, cambios, envíos)?"
+    update_state(in_.session_id, {"role": "assistant", "content": reply})
+    return {"reply": reply}
+
+
+faq.py:
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from backend.services.state_manager import (
+    get_state, update_state, maybe_extract_slots,
+    classify_intent, is_keyword_signal, Intent
+)
+from backend.services.search_service import search_candidates, _detect_categories_from_text, is_offtopic
+from backend.services.context_builder import build_context
+from backend.services.openai_client import ask_chatgpt
+from backend.routers import faq
+import random
+import re as _re 
+
+
+_TALK_RE = _re.compile(r"^\s*(hablemos|hablamos|quiero\s+que\s+hablemos|quiero\s+hablar)\s+de\b", _re.I)
+
+def _is_talk_request(text: str) -> bool:
+    return bool(_TALK_RE.search(text or ""))
+
+def _talk_small_reply() -> str:
+    return (
+        "¡Perfecto! Hablemos de iluminación 💡. "
+        "Para guiarte mejor, dime: ¿qué espacio quieres iluminar (ej.: oficina, piscina, bodega, exterior) "
+        "o el tipo de luz (ej.: reflector 200W IP65, panel 60x60, tira 24V)?"
+    )
+
+def _is_catalog_request(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "catalogo" in t or "catálogo" in t or
+        _re.search(r'\b(ver|muestrame|mu[ée]strame|ense[ñn]ame)\s+el\s+cat[aá]logo\b', t) is not None
+    )
+
+def _catalog_link_reply() -> str:
+    import os as _os
+    url = _os.getenv("ECOLITE_CATALOGO_URL", "https://ecolite.com.co/catalogo")
+    return f"Aquí puedes ver nuestro catálogo: {url}"
+
+
+_MORE_PAT = _re.compile(
+    r"\b("
+    r"mas|más|"
+    r"otras?|siguientes?|siguiente|"
+    r"ver\s+mas|ver\s+más|"
+    r"mu[eé]strame\s+otras?"
+    r")\b",
+    flags=_re.IGNORECASE
+)
+
+def is_more_signal(msg: str) -> bool:
+    return bool(_MORE_PAT.search(msg or ""))
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+PER_PAGE = 5
+
+class ChatIn(BaseModel):
+    message: str
+    session_id: str = "default"
+
+GREETING_PROMPT = (
+    "Saluda breve en tono serio/amistoso; pregunta qué espacio desea iluminar "
+    "(oficina, piscina, bodega…)."
+)
+
+SMALLTALK_PROMPT = (
+    "Responde breve y ofrece ayuda. Pide 1–2 datos clave: espacio (oficina/piscina/bodega), "
+    "tipo (decorativa/riel/industrial) o presupuesto."
+)
+
+
+def _fetch_and_reply(user_msg: str, state: dict, session_id: str) -> dict:
+    """
+    Trae productos con offset/limit, marca vistos y arma la respuesta.
+    Devuelve también 'items' para que el front pinte cards.
+    """
+    seen = state.get("seen_codes", set())
+    page = state.get("page", 0)
+
+    offset = 0 if seen else page * PER_PAGE
+
+    items = search_candidates(
+        user_msg,
+        state,
+        limit=PER_PAGE,
+        offset=offset,
+        exclude_codes=seen
+    )
+
+    if not items:
+        state["result_seed"] = random.getrandbits(32)
+        items = search_candidates(
+            user_msg,
+            state,
+            limit=PER_PAGE,
+            offset=offset,
+            exclude_codes=seen
+        )
+
+    if not items:
+        reply = "No encontré productos para esa búsqueda. ¿Quieres que te sugiera otra categoría o revisar el catálogo completo?"
+        update_state(session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply, "items": []}
+
+    for it in items:
+        state.setdefault("seen_codes", set()).add(it["code"])
+
+    contexto = build_context(user_msg, state, items)
+    reply = ask_chatgpt(contexto, "Redacta breve y lista solo estos productos.")
+    update_state(session_id, {"role": "assistant", "content": reply})
+
+    return {"reply": reply, "items": items}
+
+
+@router.post("/")
+def chat(in_: ChatIn):
+    user_msg = (in_.message or "").strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    state = get_state(in_.session_id)
+    update_state(in_.session_id, {"role": "user", "content": user_msg})
+    state["last_user_msg"] = user_msg
+
+    if _is_catalog_request(user_msg):
+        reply = _catalog_link_reply()
+        state["last_intent"] = "catalog"
+        update_state(in_.session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply, "items": []}
+
+    if _is_talk_request(user_msg):
+        state["last_intent"] = "faq_or_smalltalk"
+        state["last_query"] = None
+        state["page"] = 0
+        reply = _talk_small_reply()
+        update_state(in_.session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply, "items": []}
+
+    if is_more_signal(user_msg):
+        if is_keyword_signal(user_msg):  
+            state["page"] = 0
+            state["last_query"] = user_msg
+            state["result_seed"] = random.getrandbits(32)
+            return _fetch_and_reply(user_msg, state, in_.session_id)
+
+        if state.get("last_query"):
+            state["page"] = state.get("page", 0) + 1
+            return _fetch_and_reply(state["last_query"], state, in_.session_id)
+        else:
+            reply = "Aún no tengo una lista para ‘mostrar más’. Dime qué buscas (p. ej., ‘lámparas decorativas’, ‘reflector 100W IP65’)."
+            update_state(in_.session_id, {"role": "assistant", "content": reply})
+            return {"reply": reply, "items": []}
+
+    maybe_extract_slots(state, user_msg)
+
+    early_intent: Intent = classify_intent(user_msg)
+    if early_intent == "greeting":
+        if is_keyword_signal(user_msg) or state.get("espacio_source") in {"alias", "direct"}:
+            intent = "product_search"
+        else:
+            state["last_intent"] = None
+            reply = ask_chatgpt(f"SOS SISTEMA: {GREETING_PROMPT}", user_msg)
+            update_state(in_.session_id, {"role": "assistant", "content": reply})
+            return {"reply": reply}
+    else:
+        intent = early_intent
+
+    try:
+        if intent == "product_search" and is_offtopic(user_msg):
+            intent = "faq_or_smalltalk"
+    except Exception:
+        pass
+
+    try:
+        if intent != "product_search" and is_offtopic(user_msg):
+            reply = (
+                "No tengo información sobre ese tema. "
+                "Puedo ayudarte con iluminación y productos Ecolite 💡. "
+                "Por ejemplo: ‘lámparas decorativas’, ‘paneles solares’."
+            )
+            update_state(in_.session_id, {"role": "assistant", "content": reply})
+            return {"reply": reply, "items": []}
+    except Exception:
+        pass
+
+    if intent == "faq_or_smalltalk":
+        low = user_msg.lower()
+        if any(w in low for w in ("sugiere", "sugiéreme", "sugiereme", "recomiéndame", "recomiendame", "recomienda")) and state.get("espacio"):
+            intent = "product_search"
+            user_msg = state["espacio"]
+
+    if intent == "greeting":
+        state["last_intent"] = None
+        reply = ask_chatgpt(f"SOS SISTEMA: {GREETING_PROMPT}", user_msg)
+        update_state(in_.session_id, {"role": "assistant", "content": reply})
+        return {"reply": reply}
+
+    faq_reply = faq.try_answer(user_msg)
+    if faq_reply:
+        state["last_intent"] = "faq"
+        update_state(in_.session_id, {"role": "assistant", "content": faq_reply})
+        return {"reply": faq_reply}
+
+    if intent == "product_search":
+        state["last_intent"] = None
+        try:
+            from backend.services.state_manager import _detect_focuses_from_text
+            detected = _detect_focuses_from_text(user_msg)
+            if detected:
+                state["focus"] = set(detected)
+        except Exception:
+            pass
+
+        q = user_msg
+        if not is_keyword_signal(user_msg) and state.get("espacio"):
+            q = state["espacio"]
+
+        state["page"] = 0
+        state["last_query"] = q
+        state["result_seed"] = random.getrandbits(32)
+        return _fetch_and_reply(q, state, in_.session_id)
+
+    reply = "¿Quieres que te sugiera algo del catálogo o prefieres resolver otra duda (ej.: garantía, cambios, envíos)?"
+    update_state(in_.session_id, {"role": "assistant", "content": reply})
+    return {"reply": reply}
+
+
+context_builder.py:
+
+import json
+
+BASE_RULES = """
+Eres el asistente de Ecolite (Colombia). Sé claro, breve y profesional con tono cercano.
+Usa emojis con moderación (💡👌✨). Ayuda a elegir el producto correcto.
+
+REGLAS:
+- SOLO puedes recomendar productos de la sección CANDIDATOS_PROD que te pasa el sistema.
+- No inventes productos.
+- Muestra máximo 5 productos.
+- Si faltan datos (espacio, instalación, vatios, temperatura, presupuesto), haz 1 pregunta concreta.
+- Formato ESTRICTO de cada producto (una línea por ítem, sin markdown, sin viñetas):
+  Nombre — Precio — URL — IMG_URL
+- No digas parce, parcero ni palabras groseras, tampoco des información que no sea de la empresa (ej: "qué tal el clima", "cuanto vale un ferrari") evita cualquier tema no relacionado a la tematica de la empresa (Ecolite) el cuál eres el asistente.
+
+EJEMPLO VÁLIDO:
+Luminaria colgante y de sobreponer 48W LEDLC3B — $240.800 — https://ecolite.com.co/producto/luminaria-sobreponer-y-colgante-48w-ledlc3b/ — https://ecolite.com.co/wp-content/uploads/2025/08/LEDLC3B-B.webp
+"""
+
+def build_context(user_message: str, state: dict, candidates: list[dict]) -> str:
+    state_snapshot = {
+        "espacio": state.get("espacio"),
+        "necesidad": state.get("necesidad"),
+        "preferencias": state.get("preferencias"),
+    }
+    return f"""
+{BASE_RULES}
+
+ESTADO:
+{json.dumps(state_snapshot, ensure_ascii=False)}
+
+CANDIDATOS_PROD (elige SOLO de esta lista):
+{json.dumps(candidates, ensure_ascii=False)}
+
+Redacta una respuesta corta (1–2 frases) y luego lista los productos en el formato indicado.
+"""
+
+
+focus_rules.py:
+# backend/services/focus_rules.py
+# Reglas de foco configurables y reutilizables
+
+FOCUS_RULES = {
+    # Piscina / sumergibles
+    "piscina": {
+        "aliases": ["piscina", "sumergible", "ip68", "pentair", "nicho"],
+        "must_any": ["piscina", "ip68", "sumergible", "pentair", "nicho"],
+        "must_not": ["aplique de pared", "pared exterior", "gu10", "e27", "industrial"],
+        # Para accesorios aceptados (si faltan sumergibles)
+        "accessories_any": ["nicho", "controlador rgb", "rgb", "waterproof", "ip68", "fuente ip68", "piscina"],
+    },
+
+    "industrial": {
+        "aliases": ["industrial", "campana", "highbay", "ufo", "bodega", "nave"],
+        "must_any": ["industrial", "campana", "highbay", "ufo"],
+        "must_not": ["bombillo", "gu10", "e27", "decorativa"],
+        "accessories_any": [],
+    },
+
+
+    # Riel magnético / track
+    "riel_magnetico": {
+        "aliases": ["riel", "magnético", "magnetico", "track", "smart"],
+        "must_any": ["riel", "magnético", "magnetico", "track"],
+        "must_not": ["sumergible", "ip68", "piscina", "industrial pesada"],
+        "accessories_any": ["conector", "fuente", "dc42v", "100w", "controlador", "driver"],
+    },
+
+    # Tiras LED / neon flex
+    "tiras_led": {
+        "aliases": ["tira", "cinta", "neon", "led strip"],
+        "must_any": ["tira", "cinta", "neon", "led strip"],
+        "must_not": ["sumergible ip68 piscina pentair"],  # genéricas fuera de piscina
+        "accessories_any": ["fuente", "driver", "controlador", "rgb", "12v", "24v"],
+    },
+
+    # Lámparas decorativas
+    "decorativa": {
+        "aliases": ["decorativa", "decorar", "ambiente", "colgante", "aplique", "lineal"],
+        "must_any": ["decorativa", "colgante", "aplique", "lineal", "decorativo"],
+        "must_not": ["industrial", "highbay", "campana", "flood", "reflector"],
+        "accessories_any": [],
+    },
+
+    # Industrial / highbay
+    "industrial": {
+        "aliases": ["industrial", "campana", "highbay", "nave", "bodega"],
+        "must_any": ["industrial", "campana", "highbay"],
+        "must_not": ["piscina", "sumergible", "ip68", "decorativa"],
+        "accessories_any": [],
+    },
+
+    # Exterior (no sumergible)
+    "exterior": {
+        "aliases": ["exterior", "jardin", "jardín", "fachada", "poste", "estadio", "cancha"],
+        "must_any": ["exterior", "jardin", "jardín", "ip65", "ip66", "ip67"],
+        "must_not": ["piscina", "sumergible", "ip68"],
+        "accessories_any": [],
+    },
+
+    # Portalámparas / bombillería
+    "gu10": {
+        "aliases": ["gu10"],
+        "must_any": ["gu10"],
+        "must_not": [],
+        "accessories_any": [],
+    },
+    "e27": {
+        "aliases": ["e27", "filamento", "vintage"],
+        "must_any": ["e27"],
+        "must_not": [],
+        "accessories_any": [],
+    },
+
+    # Emergencia
+    "emergencia": {
+        "aliases": ["emergencia", "señalización", "exit"],
+        "must_any": ["emergencia", "señalización", "exit"],
+        "must_not": ["piscina", "sumergible"],
+        "accessories_any": [],
+    },
+}
+
+
+openai_client.py:
+
+import os
+from openai import OpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("Falta OPENAI_API_KEY (configura .env)")
+
+_client = OpenAI(api_key=OPENAI_API_KEY)
+
+def ask_chatgpt(system_prompt: str, user_message: str) -> str:
+    resp = _client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content
+
+
+product_loeader.py:# backend/services/product_loader.py
+from __future__ import annotations
+import json
+import unicodedata
+import re
+from pathlib import Path
+from typing import Dict, Tuple, Any, List
+
+
+# Ruta fija (sin ENV): coloca tu productos.json aquí
+DATA_PATH = Path(__file__).parent.parent / "data" / "productos.json"
+
+# Caché (carga perezosa). Debe ser: dict[str, dict] para compatibilidad con search_service.
+PRODUCTOS: Dict[str, dict] = {}
+
+
+
+# -----------------------------
+# Utilidades
+# -----------------------------
+def _require_dict(d: Any, msg: str) -> dict:
+    if not isinstance(d, dict):
+        raise RuntimeError(msg)
+    return d
+
+def _norm(s: str) -> str:
+    """Normaliza texto: minúsculas, sin tildes, espacios colapsados."""
+    s = "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c) != "Mn")
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _normalize_product(code: str, rec: dict) -> dict:
+    """
+    Garantiza que cada producto tenga los campos mínimos y tipos esperados por search_service.
+    """
+    code_up = (code or "").strip().upper()
+    if not code_up:
+        raise RuntimeError("Producto con clave vacía")
+
+    name = (rec.get("name") or rec.get("title") or code_up)
+    price = (rec.get("price") or rec.get("precio") or "").strip()
+    url = (rec.get("url") or "").strip()
+    img_url = (rec.get("img_url") or rec.get("image") or "").strip()
+
+    def _to_list(v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return [str(v).strip()]
+
+    categories: List[str] = _to_list(rec.get("categories") or rec.get("category"))
+    tags: List[str] = _to_list(rec.get("tags"))
+
+    # Normalización de categorías originales
+    categories_norm: List[str] = [_norm(c) for c in categories if c]
+
+    semantic_rules = {
+        "piscina": ["jacuzzi", "acuática", "acuaticas", "sumergible"],
+        "decorativa": ["cuarto", "habitacion", "habitación", "alcoba", "pieza",
+                       "dormitorio", "sala", "comedor", "living"],
+        "interior": ["oficina", "consultorio", "estudio", "recepcion", "recepción"],
+        "industrial": ["bodega", "taller", "fabrica", "fábrica",
+                       "planta", "nave", "galpon", "galpón"],
+    }
+
+    extra_norms: List[str] = []
+    for base, synonyms in semantic_rules.items():
+        if any(base in c for c in categories_norm):
+            extra_norms.extend(synonyms)
+
+    categories_norm = list(set(categories_norm + [_norm(e) for e in extra_norms]))
+
+    return {
+        "code": code_up,
+        "name": str(name).strip(),
+        "price": str(price),
+        "url": url,
+        "img_url": img_url,
+        "categories": categories,
+        "categories_norm": categories_norm,
+        "tags": tags,
+        "category": rec.get("category") if isinstance(rec.get("category"), str) else None,
+    }
+
+# -----------------------------
+# Carga desde disco (perezosa)
+# -----------------------------
+def _load_from_disk() -> Dict[str, dict]:
+    if not DATA_PATH.exists():
+        raise RuntimeError(
+            "No se encontró el catálogo de productos.\n"
+            f"Coloca el archivo en: {DATA_PATH}\n"
+            "Sugerencia: crea la carpeta backend/data y copia allí tu productos.json"
+        )
+    with open(DATA_PATH, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    data = _require_dict(raw, "productos.json debe ser un objeto {code: {...}}")
+
+    out: Dict[str, dict] = {}
+    for code, rec in data.items():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            normalized = _normalize_product(code, rec)
+        except Exception:
+            continue
+        out[normalized["code"]] = normalized
+
+    if not out:
+        raise RuntimeError("productos.json cargó vacío o inválido")
+
+    return out
+
+def load_products() -> Tuple[Dict[str, dict], Path]:
+    """Carga (o devuelve caché) y retorna (PRODUCTOS, DATA_PATH)."""
+    global PRODUCTOS
+    if not PRODUCTOS:
+        PRODUCTOS = _load_from_disk()
+    return PRODUCTOS, DATA_PATH
+
+def reload_products() -> Tuple[Dict[str, dict], Path]:
+    """Fuerza recarga desde disco."""
+    global PRODUCTOS
+    PRODUCTOS = _load_from_disk()
+    return PRODUCTOS, DATA_PATH
+
+
+
+for p in PRODUCTOS.values():
+    raw_cats = p.get("categories", [])
+    p["categories_norm"] = [_norm(c) for c in raw_cats if c]
+
+
+search_service.py:
+
+import re
+import unicodedata
+from typing import List, Dict, Tuple, Set, Optional
+import random
+from backend.services.product_loader import load_products, PRODUCTOS
+from backend.services.focus_rules import FOCUS_RULES
+
+# ============================
+# Carga segura del catálogo
+# ============================
+def _ensure_catalog():
+    global PRODUCTOS
+    if not PRODUCTOS:
+        PRODUCTOS, _ = load_products()
+
+
+# ============================
+# Vocablo de dominio + Off-topic
+# ============================
+
+_DOMAIN_VOCAB: Set[str] = set()
+_DOMAIN_READY: bool = False
+
+def _ensure_domain_vocab():
+    """
+    Construye un vocabulario de dominio dinámico a partir del catálogo y reglas de foco.
+    Se genera 1 sola vez en memoria.
+    """
+    global _DOMAIN_READY, _DOMAIN_VOCAB
+    if _DOMAIN_READY:
+        return
+    _ensure_catalog()
+    vocab: Set[str] = set()
+
+    def _add_text(s: str):
+        for t in _tokenize(_norm(s or "")):
+            if len(t) >= 3:
+                vocab.add(t)
+
+    for p in PRODUCTOS.values():
+        try:
+            blob = _product_blob(p)  
+        except Exception:
+            blob = f"{p.get('name','')} {' '.join(p.get('categories',[]) or [])} {p.get('description','')} {p.get('code','')}"
+        _add_text(blob)
+
+    try:
+        for r in FOCUS_RULES.values():
+            for key in ("aliases", "must_any", "accessories_any", "must_not"):
+                for val in r.get(key, []) or []:
+                    _add_text(val)
+    except Exception:
+        pass
+
+    _DOMAIN_VOCAB = vocab
+    _DOMAIN_READY = True
+
+_LIGHTING_HINT_RE = re.compile(
+    r"(?:\b(?:e27|e14|g9|gu10|mr16|t8|t5)\b)|"          # casquillos/tipos
+    r"(?:\bip6[5-8]\b)|"                                # IP65..IP68
+    r"(?:\b(?:12|24|110|220)v\b)|"                      # voltajes
+    r"(?:\b\d{2,3}w\b)|"                                # vatios (10w..999w)
+    r"(?:\b\d{3,4}k\b)|"                                # temperatura (2700k..6500k)
+    r"(?:\b(?:lm|lumen(?:es)?)\b)",                     # lúmenes
+    flags=re.IGNORECASE
+)
+
+def _has_lighting_hints(msg: str) -> bool:
+    return bool(_LIGHTING_HINT_RE.search(msg))
+
+_DOMAIN_VOCAB: Set[str] = set()
+_DOMAIN_READY: bool = False
+
+_CORE_DOMAIN_TOKENS: Set[str] = {
+    "led","lampara","lamparas","luz","luces","aplique","reflector","panel","tubo","riel",
+    "decorativa","industrial","piscina","sumergible","ip65","ip66","ip67","ip68",
+    "gu10","e27","mr16","g9","t8","t5","rgb","driver","fuente","controlador","campana","highbay",
+    "solar","exterior","interior","emergencia","seguridad","cctv"
+}
+
+_WEAK_TOKENS: Set[str] = {"oro","dorado","dorada","plateado","plateada","negro","negra","blanco","blanca","gris","mate","brillante"}
+
+_STOPWORDS_ES: Set[str] = {
+    "de","del","la","el","los","las","un","una","unos","unas","y","o","u","a","en",
+    "por","para","con","sin","que","quien","quién","cuando","cuándo","donde","dónde",
+    "como","cómo","cual","cuál","cuáles","es","son","ser","estar","haber","hay","hace",
+    "al","este","esta","esto","estas","estos","lo","le","les","mi","tu","su","sus"
+}
+
+def _ensure_domain_vocab():
+    """
+    Construye un vocabulario de dominio dinámico a partir del catálogo y reglas de foco.
+    Se genera 1 sola vez en memoria.
+    """
+    global _DOMAIN_READY, _DOMAIN_VOCAB
+    if _DOMAIN_READY:
+        return
+    _ensure_catalog()
+    vocab: Set[str] = set()
+
+    def _add_text(s: str):
+        for t in _tokenize(_norm(s or "")):
+            if len(t) >= 3:
+                vocab.add(t)
+
+    for p in PRODUCTOS.values():
+        try:
+            blob = _product_blob(p)
+        except Exception:
+            blob = f"{p.get('name','')} {' '.join(p.get('categories',[]) or [])} {p.get('description','')} {p.get('code','')}"
+        _add_text(blob)
+
+    try:
+        for r in FOCUS_RULES.values():
+            for key in ("aliases", "must_any", "accessories_any", "must_not"):
+                for val in r.get(key, []) or []:
+                    _add_text(val)
+    except Exception:
+        pass
+
+    _DOMAIN_VOCAB = vocab
+    _DOMAIN_READY = True
+
+_LIGHTING_HINT_RE = re.compile(
+    r"(?:\b(?:e27|e14|g9|gu10|mr16|t8|t5)\b)|"
+    r"(?:\bip6[5-8]\b)|"
+    r"(?:\b(?:12|24|110|220)v\b)|"
+    r"(?:\b\d{2,3}w\b)|"
+    r"(?:\b\d{3,4}k\b)|"
+    r"(?:\b(?:lm|lumen(?:es)?)\b)",
+    flags=re.IGNORECASE
+)
+
+def _has_lighting_hints(msg: str) -> bool:
+    return bool(_LIGHTING_HINT_RE.search(msg or ""))
+
+def is_offtopic(user_msg: str) -> bool:
+    """
+    Heurística robusta y *dinámica*:
+      IN-TOPIC si:
+        - Hay pistas claras de iluminación (IP, W, K, casquillos), o
+        - Coincide ≥1 token del núcleo (_CORE_DOMAIN_TOKENS), o
+        - Coinciden ≥2 tokens del vocabulario dinámico *excluyendo* tokens débiles,
+          o la razón de coincidencias (sin débiles) ≥ 0.40.
+      OFF-TOPIC en otro caso.
+    """
+    text = _norm(user_msg or "")
+    toks = [t for t in _tokenize(text) if len(t) >= 3 and t not in _STOPWORDS_ES]
+    if not toks:
+        return False  
+    _ensure_domain_vocab()
+
+    if _has_lighting_hints(text):
+        return False
+
+    if any(t in _CORE_DOMAIN_TOKENS for t in toks):
+        return False
+
+    domain_hits = sum(1 for t in toks if (t in _DOMAIN_VOCAB and t not in _WEAK_TOKENS))
+    ratio = domain_hits / max(1, len(toks))
+
+    return not (domain_hits >= 2 or ratio >= 0.40)
+
+# ============================
+# Normalización y utilidades
+# ============================
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c) != "Mn")
+
+def _norm(s: str) -> str:
+    s = _strip_accents((s or "").lower())
+    s = re.sub(r"[^a-z0-9\s\-\_\/\.\%]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _tokenize(s: str) -> List[str]:
+    return _norm(s).split()
+
+def _product_blob(p: Dict) -> str:
+    parts = [
+        p.get("code") or "",
+        p.get("name") or "",
+        " ".join(p.get("tags") or []),
+        " ".join(p.get("categories") or []),
+        str(p.get("category") or ""),
+    ]
+    return " ".join(parts)
+
+# ============================
+# Mapa de categorías (con alias)
+# ============================
+
+CATEGORY_MAP = {
+    # --- Cintas LED ---
+    "cintas led": "cintas led",
+    "tiras led": "cintas led",
+    "tiras luces led": "cintas led",
+    "luces led flexibles": "cintas led",
+    "luces neón": "cintas led",
+    "neon led": "cintas led",
+    "luces de tira": "cintas led",
+    "luces de rollo": "cintas led",
+    "led strip": "cintas led",
+    "flex strip": "cintas led",
+    "strip light": "cintas led",
+    "led neon": "cintas led",
+
+    # --- Fuentes de poder ---
+    "fuente": "fuentes de poder",
+    "fuentes de poder": "fuentes de poder",
+    "driver": "fuentes de poder",
+    "drivers": "fuentes de poder",
+    "power supply": "fuentes de poder",
+    "transformador": "fuentes de poder",
+    "adaptador": "fuentes de poder",
+    "alimentador": "fuentes de poder",
+    "controlador": "fuentes de poder",
+
+    # --- Highbay / Campanas ---
+    "highbay": "industrial",
+    "campana": "industrial",
+    "campana ufo": "industrial",
+    "campana industrial": "industrial",
+    "industrial highbay": "industrial",
+    "ufo light": "industrial",
+    "high bay": "industrial",
+
+    # --- Reflectores ---
+    "reflector": "exterior",
+    "reflectores": "exterior",
+    "reflectores led": "exterior",
+    "luces exteriores": "exterior",
+    "foco reflector": "exterior",
+    "proyector": "exterior",
+    "flood light": "exterior",
+    "spot led": "exterior",
+    "estadio": "exterior",
+    "cancha": "exterior",
+
+    # --- Paneles LED ---
+    "panel": "panel",
+    "paneles": "panel",
+    "panel de techo": "panel",
+    "luz de techo": "panel",
+    "panel embutido": "panel",
+    "downlight panel": "panel",
+    "led panel light": "panel",
+
+    # --- Bombillos LED ---
+    "bombillo": "lamp",
+    "bombillos": "lamp",
+    "bombilla": "lamp",
+    "foco led": "lamp",
+    "ampolleta": "lamp",
+    "bulb": "lamp",
+    "lampara rosca": "lamp",
+    "led bulb": "lamp",
+
+    # --- Lámparas decorativas ---
+    "lampara decorativa": "decorativa",
+    "lamparas decorativas": "decorativa",
+    "lamparas deco": "decorativa",
+    "lamparas diseño": "decorativa",
+    "colgantes": "decorativa",
+    "decorativas": "decorativa",
+    "lampara de techo": "decorativa",
+    "pendant light": "decorativa",
+    "decorative lamp": "decorativa",
+    "lampara": "lamp",
+    "lamparas": "lamp",
+    "lampara solar": "solar",
+    "lampara emergencia": "emergencia",
+    "lampara de techo": "decorativa",
+
+    # ➕ Sinónimos colombianos
+    "pieza": "decorativa",
+    "alcoba": "decorativa",
+    "habitacion": "decorativa",
+    "habitación": "decorativa",
+    "dormitorio": "decorativa",
+    "sala": "decorativa",
+    "comedor": "decorativa",
+    "living": "decorativa",
+    "cuarto": "decorativa",
+
+    # --- Oficina ---
+    "luces oficina": "oficina",
+    "lamparas oficina": "oficina",
+    "iluminación oficina": "oficina",
+    "office light": "oficina",
+    "luminaria corporativa": "oficina",
+    "techo oficina": "oficina",
+    "ofisina": "oficina",
+    "oficina": "oficina",
+    "estudio": "oficina",
+    "consultorio": "oficina",
+    "recepcion": "oficina",
+    "recepción": "oficina",
+
+    # --- Industrial ---
+    "luces industriales": "industrial",
+    "lamparas industriales": "industrial",
+    "iluminación bodega": "industrial",
+    "warehouse light": "industrial",
+    "factory light": "industrial",
+    "industrial lamp": "industrial",
+    "bodega": "industrial",
+    "taller": "industrial",
+    "fabrica": "industrial",
+    "fábrica": "industrial",
+    "nave": "industrial",
+    "planta": "industrial",
+    "galpon": "industrial",
+    "galpón": "industrial",
+
+    # --- Piscina ---
+    "luces piscina": "piscina",
+    "luces sumergibles": "piscina",
+    "iluminación piscina": "piscina",
+    "pool light": "piscina",
+    "submersible led": "piscina",
+    "luces acuáticas": "piscina",
+    "jacuzzi": "piscina",
+    "piscina": "piscina",
+    "sumergible": "piscina",
+    "ip68": "piscina",
+    "acuatica": "piscina",
+    "acuática": "piscina",
+
+    # --- Solares ---
+    "lampara solar": "solar",
+    "lamparas solares": "solar",
+    "lámpara solar": "solar",
+    "lámparas solares": "solar",
+    "luminaria solar": "solar",
+    "luminarias solares": "solar",
+    "luz solar": "solar",
+    "luces solares": "solar",
+    "iluminacion solar": "solar",
+    "iluminación solar": "solar",
+    "reflector solar": "solar",
+    "reflectores solares": "solar",
+    "solar light": "solar",
+    "solar led": "solar",
+
+    # --- Tubos ---
+    "tubo": "tubo",
+    "tubos": "tubo",
+    "tubo fluorescente led": "tubo",
+    "fluorescente led": "tubo",
+    "tube light": "tubo",
+    "led tube": "tubo",
+    "t8 led": "tubo",
+
+    # --- Emergencia ---
+    "emergencia": "emergencia",
+    "salida emergencia": "emergencia",
+    "luz emergencia": "emergencia",
+    "exit light": "emergencia",
+    "emergency lamp": "emergencia",
+    "señal salida": "emergencia",
+
+    # --- Apliques ---
+    "aplique": "decorativa",
+    "apliques pared": "decorativa",
+    "luces pared": "decorativa",
+    "wall light": "decorativa",
+    "aplique exterior": "decorativa",
+    "sconce": "decorativa",
+    "wall lamp": "decorativa",
+
+    # --- Riel ---
+    "luces riel": "riel",
+    "lamparas riel": "riel",
+    "track light": "riel",
+    "sistema riel": "riel",
+    "focos riel": "riel",
+    "rail lighting": "riel",
+
+    # --- Smart / Seguridad ---
+    "camara": "seguridad",
+    "camara solar": "seguridad",
+    "cctv": "seguridad",
+    "cámara de seguridad": "seguridad",
+    "smart light": "seguridad",
+    "wifi light": "seguridad",
+    "inteligente": "seguridad",
+    "porteria": "seguridad",
+    "portería": "seguridad",
+}
+
+ACCESSORY_INTENT_WORDS = {
+    "accesorio", "accesorios", "fuente", "driver", "controlador", "controller",
+    "nicho", "soporte", "conector", "transformador", "rgb", "rgbw"
+}
+
+ACCESSORIES_BY_CATEGORY: Dict[str, List[str]] = {
+    "piscina": ["nicho", "controlador rgb", "rgb", "fuente ip68", "waterproof", "pentair"],
+    "riel": ["conector", "fuente", "driver", "dc42v", "100w", "controlador"],
+    "tiras": ["fuente", "driver", "controlador", "rgb", "12v", "24v"],
+    "exterior": [],
+    "industrial": [],
+    "decorativa": [],
+    "emergencia": [],
+    "gu10": [],
+    "e27": [],
+    "panel": [],
+    "lineal": [],
+    "colgante": [],
+    "alumbrado publico": [],
+}
+
+from collections import defaultdict
+
+REVERSE_CATEGORY_MAP: Dict[str, List[str]] = defaultdict(list)
+for alias, target in CATEGORY_MAP.items():
+    REVERSE_CATEGORY_MAP[target].append(alias)
+
+# ============================
+# Fuzzy matching
+# ============================
+def _fuzzy_contains(a: str, b: str) -> bool:
+    a = _norm(a)
+    b = _norm(b)
+    b_tokens = _tokenize(b)
+    if not b_tokens:
+        return False
+
+    a_tokens = _tokenize(a)
+
+    def token_matches_any(w: str) -> bool:
+        if w in a_tokens:
+            return True
+        if any(tok.startswith(w) for tok in a_tokens):
+            return True
+        if "-" in w:
+            parts = w.split("-")
+            for i in range(len(a_tokens) - len(parts) + 1):
+                if all(a_tokens[i + j].startswith(parts[j]) for j in range(len(parts))):
+                    return True
+        return False
+
+    return all(token_matches_any(w) for w in b_tokens)
+
+def _detect_categories_from_text(user_msg: str) -> list[str]:
+    prods, _ = load_products()
+    norm_msg = _norm(user_msg)
+
+    detected = []
+
+    for alias, target in CATEGORY_MAP.items():
+        if alias in norm_msg:
+            detected.append(target)
+
+    for p in prods.values():
+        for cat in p.get("categories_norm", []):
+            if norm_msg in cat or cat in norm_msg:
+                detected.append(cat)
+
+    return list(set(detected))
+
+# ============================
+# Constraints (regex/sets)
+# ============================
+IP_RE   = re.compile(r"\bip\s*(6[5678]|[0-5]?\d)\b", re.I)
+VOLT_RE = re.compile(r"\b(12\s*v|24\s*v|110\s*v|220\s*v|12-?voltios?|24-?voltios?)\b", re.I)
+SOCKETS = {"gu10","e27"}
+RGB_WORDS = {"rgb","rgbw","controlador rgb"}
+
+def _extract_constraints(text: str) -> Dict:
+    txt = text or ""
+    t = _norm(txt)
+    ips = set("ip"+m.group(1) for m in IP_RE.finditer(txt))
+    volts = set(m.group(1).lower().replace(" ", "") for m in VOLT_RE.finditer(txt))
+    socks = {s for s in SOCKETS if s in t}
+
+    wants_rgb = any(w in t for w in RGB_WORDS)
+
+    wants_sumergible = (
+        ("sumergible" in t) or
+        ("ip68" in t) or
+        ("piscina" in t) or
+        ("pool" in t) or
+        ("acuatic" in t) 
+    )
+
+    return {
+        "ips": ips,
+        "volts": volts,
+        "sockets": socks,
+        "rgb": wants_rgb,
+        "sumergible": wants_sumergible,
+    }
+
+# ============================
+# Focus
+# ============================
+def _passes_focus(nb: str, active_focus: Set[str]) -> bool:
+    if not active_focus:
+        return True
+    for f in active_focus:
+        rule = FOCUS_RULES.get(f)
+        if not rule:
+            continue
+        must_any = [ _norm(x) for x in (rule.get("must_any") or []) ]
+        must_not = [ _norm(x) for x in (rule.get("must_not") or []) ]
+        if must_any and not any(x in nb for x in must_any):
+            return False
+        if must_not and any(x in nb for x in must_not):
+            return False
+    return True
+
+# ============================
+# Guards de categorías (STRICT MODE)
+# ============================
+def _build_category_guards(active_cats: List[str]) -> List[Set[str]]:
+    """
+    Construye conjuntos de alias normalizados para cada categoría activa.
+    Habilita STRICT_MODE (fix de retorno).
+    """
+    guards: List[Set[str]] = []
+    for cat in active_cats:
+        alias_list = REVERSE_CATEGORY_MAP.get(cat, []) if 'REVERSE_CATEGORY_MAP' in globals() else []
+        if not alias_list:
+            alias_list = [cat]
+        norm_aliases = { _norm(a) for a in alias_list if str(a).strip() }
+        if norm_aliases:
+            guards.append(norm_aliases)
+    return guards
+
+# ============================
+# Chequeo estricto de categorías (con parciales)
+# ============================
+def _passes_categories_strict(nb: str, guards: List[Set[str]], product: dict) -> bool:
+    """
+    Pasa si cumple al menos un alias de cada categoría activa,
+    aceptando coincidencias parciales contra categories_norm.
+    """
+    if not guards:
+        return True
+
+    prod_cats = product.get("categories_norm") or []
+    prod_cat_text = " ".join(prod_cats)
+
+    for alias_set in guards:
+        ok = False
+        for alias in alias_set:
+            if alias in nb: 
+                ok = True
+                break
+            if any(alias in pc or pc in alias for pc in prod_cats): 
+                ok = True
+                break
+            if alias in prod_cat_text:
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
+def _expand_query_tokens(user_msg: str) -> list[str]:
+    """
+    Expande tokens de la consulta para buscar coincidencias *parciales* en todo el catálogo,
+    sin atar a categorías. Incluye normalización y variantes simples (plural/singular).
+    """
+    toks = [t for t in _tokenize(user_msg) if len(t) >= 2]
+    expanded = set()
+    for t in toks:
+        expanded.add(t)
+        nt = _norm(t)
+        expanded.add(nt)
+        if nt.endswith("es") and len(nt) > 3:
+            expanded.add(nt[:-2]) 
+        if nt.endswith("s") and len(nt) > 3:
+            expanded.add(nt[:-1])  
+    return [x for x in expanded if len(x) >= 2]
+
+
+# ============================
+# Coincidencia parcial por tokens (global)
+# ============================
+def _partial_token_match(nb: str, toks: list[str]) -> bool:
+    """
+    Coincidencia parcial *global*: devuelve True si suficientes tokens aparecen como substrings en nb.
+    - Umbral adaptativo: al menos 1 token, o ~50% (capado a 3) si la consulta es larga.
+    """
+    if not toks:
+        return True
+    hits = sum(1 for t in toks if t in nb)
+    need = 1
+    if len(toks) >= 4:
+        need = min(3, (len(toks) + 1) // 2)
+    return hits >= need
+
+
+# ============================
+# Presupuesto
+# ============================
+def _parse_budget(raw: Optional[str]) -> Optional[int]:
+    if not raw:
+        return None
+    s = raw.strip().lower().replace(" ", "")
+    s = s.replace("$","")
+    if s.endswith("k"):
+        try:
+            return int(float(s[:-1]) * 1000)
+        except Exception:
+            return None
+    if s.endswith("mil"):
+        try:
+            return int(float(s[:-3]) * 1000)
+        except Exception:
+            return None
+    s = s.replace(".", "").replace(",", "")
+    if s.isdigit():
+        return int(s)
+    return None
+
+# ============================
+# Coincidencia por CÓDIGO
+# ============================
+_CODE_RE = re.compile(r"\b[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]+)?\b", re.I)
+
+def _code_hits(user_msg: str) -> List[Dict]:
+    _ensure_catalog()
+    seen: Set[str] = set()
+
+    for m in _CODE_RE.finditer(user_msg or ""):
+        code_q = m.group(0).upper()
+        p = PRODUCTOS.get(code_q)
+
+        if not p:
+            for _, rec in PRODUCTOS.items():
+                if str(rec.get("code","")).upper() == code_q:
+                    p = rec
+                    break
+
+        if not p:
+            for _, rec in PRODUCTOS.items():
+                if str(rec.get("code","")).upper().startswith(code_q):
+                    p = rec
+                    break
+
+        if not p:
+            continue
+
+        code = str(p.get("code") or "").upper()
+        if code in seen:
+            continue
+        seen.add(code)
+
+        return [{
+            "code": code,
+            "name": p.get("name"),
+            "price": p.get("price"),
+            "url": p.get("url"),
+            "img_url": p.get("img_url"),
+        }]
+
+    return []
+
+
+# ============================
+# Scoring
+# ============================
+def _score_product(p: Dict, toks: List[str], budget_num: Optional[int]) -> int:
+    nb = _norm(_product_blob(p))
+    score = 0
+
+    name_words = set(_tokenize(p.get("name","")))
+    for t in toks:
+        if t in name_words:
+            score += 5
+        elif t in nb:
+            score += 3
+        else:
+            if any(w.startswith(t) for w in name_words):
+                score += 1
+
+    query_has_venue = any(t in {"estadio", "cancha"} for t in toks)
+    if query_has_venue:
+        if any(w in nb for w in ("reflector", "flood", "proyector")):
+            score += 4
+        if any(w in nb for w in ("ip65", "ip66", "ip67")):
+            score += 2
+
+        import re as _re
+        m = _re.search(r'(\d{2,4})\s*w\b', nb, flags=_re.I)
+        if m:
+            try:
+                w = int(m.group(1))
+                if w >= 150:
+                    score += 4
+                elif w <= 50:
+                    score -= 2
+            except Exception:
+                pass
+
+        if "solar" not in toks and "solar" in nb:
+            score -= 4
+
+        if any(w in nb for w in ("cctv", "camara", "cámara", "hikvision")):
+            score -= 6
+
+    if budget_num is not None:
+        price_str = str(p.get("price") or "")
+        price_num = None
+        s = price_str.replace("$","").replace(".","").replace(",","").strip()
+        if s.isdigit():
+            price_num = int(s)
+        if price_num:
+            if abs(price_num - budget_num) <= max(1, int(budget_num * 0.2)):
+                score += 2
+            elif price_num > int(budget_num * 1.5):
+                score -= 2
+
+    return score
+
+# ============================
+# Búsqueda principal
+# ============================
+def search_candidates(user_msg: str,
+                      state: dict,
+                      limit: int = 5,
+                      offset: int = 0,
+                      exclude_codes: Optional[Set[str]] = None) -> List[Dict]:
+    """
+    Búsqueda *global y parcial* sobre todo el catálogo:
+    - No fuerza categorías ni 'modo estricto' por defecto.
+    - Aplica 'focus' si está activo (excluye categorías indebidas, p. ej. piscina vs exterior).
+    - Usa substring matching sobre el 'blob' normalizado de cada producto.
+    - Respeta constraints explícitos (IP, voltajes, sockets, RGB, sumergible).
+    - Soporta paginación con 'seen_codes' para 'muéstrame otras/más'.
+    """
+    _ensure_catalog()
+    exclude_codes = exclude_codes or set()
+
+    code_hits = _code_hits(user_msg)
+    if code_hits:
+        if "seen_codes" in state:
+            state["seen_codes"].clear()
+        return code_hits
+
+    active_focus: Set[str] = set(state.get("focus") or [])
+    if not active_focus:
+        try:
+            from backend.services.state_manager import _detect_focuses_from_text as _detect
+            active_focus = set(_detect(user_msg))
+        except Exception:
+            active_focus = set()
+
+    toks = _expand_query_tokens(user_msg)
+
+    cons = _extract_constraints(user_msg)
+
+    budget_num = _parse_budget((state.get("preferencias") or {}).get("presupuesto"))
+
+    if "result_seed" not in state:
+        state["result_seed"] = random.getrandbits(32)
+    rng = random.Random(state["result_seed"])
+
+    scored: List[Tuple[float, Dict]] = []
+    for code, p in PRODUCTOS.items():
+        codeU = str(p.get("code") or code).upper()
+        if codeU in exclude_codes:
+            continue
+
+        nb = _norm(_product_blob(p))
+
+        if active_focus and not _passes_focus(nb, active_focus):
+            continue
+
+        if toks and not _partial_token_match(nb, toks):
+            continue
+
+        if not _passes_constraints(nb, cons, p):
+            continue
+
+        score = _score_product(p, toks, budget_num)
+        if score <= 0:
+            score = 1
+
+        payload = {
+            "code": codeU,
+            "name": p.get("name"),
+            "price": p.get("price"),
+            "url": p.get("url"),
+            "img_url": p.get("img_url"),
+        }
+
+        jitter = rng.random() * 0.49
+        scored.append((float(score) + jitter, payload))
+
+    scored.sort(key=lambda x: (-x[0], x[1]["code"]))
+    out = [it for _, it in scored]
+    out = [it for it in out if it["code"] not in exclude_codes]
+    return out[offset: offset + limit]
+
+
+# ============================
+# Constraints globales
+# ============================
+def _passes_constraints(nb: str, cons: Dict, prod: Dict = None) -> bool:
+    """
+    Aplica *solo* constraints explícitos del usuario (IP/voltajes/sockets/RGB/sumergible).
+    No se fuerza ninguna categoría (la búsqueda es global y parcial).
+    """
+    ips: Set[str] = set(cons.get("ips") or [])
+    if ips and not any(ip in nb for ip in ips):
+        return False
+
+    volts: Set[str] = set(cons.get("volts") or [])
+    if volts and not any(v in nb for v in volts):
+        return False
+
+    socks: Set[str] = set(cons.get("sockets") or [])
+    if socks and not any(s in nb for s in socks):
+        return False
+
+    if cons.get("rgb"):
+        if not any(w in nb for w in ("rgb", "rgbw", "controlador rgb")):
+            return False
+
+    if cons.get("sumergible"):
+        if not any(w in nb for w in ("sumergible", "ip68", "subacuat", "subacuatic", "submar", "acuática", "acuatica")):
+            return False
+
+    return True
+
+
+
+
+state_manager.py:
+
+import re
+from typing import Literal
+from backend.services.focus_rules import FOCUS_RULES
+from backend.services.search_service import CATEGORY_MAP
+import difflib
+
+_SESSIONS: dict[str, dict] = {}
+
+def get_state(session_id: str) -> dict:
+    if session_id not in _SESSIONS:
+        _SESSIONS[session_id] = {
+            "espacio": None,
+            "espacio_source": None,  
+            "necesidad": None,
+            "preferencias": {
+                "vatios": None, "temp_color": None, "instalacion": None, "presupuesto": None
+            },
+            "historial": [],
+            "last_filter": None,
+            "last_items": [],
+            "page": 0,
+            "seen_codes": set(),
+            "focus": set(),
+        }
+    return _SESSIONS[session_id]
+
+
+def _detect_focuses_from_text(text: str) -> set[str]:
+    t = (text or "").lower()
+    active = set()
+    for key, rule in FOCUS_RULES.items():
+        if any(alias in t for alias in rule["aliases"]):
+            active.add(key)
+    return active
+
+def update_state(session_id: str, message: dict):
+    st = get_state(session_id)
+    st["historial"].append(message)
+    return st
+
+_WATTS = re.compile(r"(\d{1,3})\s*?w\b", re.I)
+_TEMP  = re.compile(r"(3000|4000|6500)\s*?k\b", re.I)
+_MONEY = re.compile(r"(\$?\s?\d{2,3}\.?\d{0,3}\.?\d{0,3}|\d+\s?(mil|k))", re.I)
+
+ESPACIOS = {"oficina","piscina","bodega","pasillo","sala","cocina","exterior","jardin","jardín","calle"}
+NECESIDADES = {"decorativa","industrial","emergencia","panel","tubo","colgante","campana","flood","reflector",
+               "riel","magnético","magnetico","gu10","e27"}
+
+
+_GREETINGS = {"hola","holi","buenas","buenos dias","buenas tardes","buenas noches","que tal","hey","hi","hello"}
+_MORE = {
+    "muestrame otros","muestrame mas","mostrar mas","mostrar más","otros","más","mas",
+    "enséñame otros","muéstrame otros","enséñame más","muéstrame más",
+    "muestrame otras","otras","enséñame otras","muéstrame otras", "recomiendame mas", "recomiéndame más", "recomiendame más"
+}
+_CODE_RE = re.compile(r"\b[A-Z0-9]{3,}(?:-[A-Z0-9]+)?\b", re.I)
+
+_KEYWORDS_SIGNAL = {
+    "piscina","ip68","sumergible","oficina","bodega","exterior","jardin","jardín",
+    "decorativa","industrial","emergencia","panel","tubo","colgante","campana",
+    "flood","reflector","fuente","driver","power","transformador","12v","24v",
+    "tira","cinta","neon","led strip","rgb","controlador","nicho","riel","track",
+    "magnético","magnetico","gu10","e27","dc42v","100w", "estadio","cancha"
+}
+
+Intent = Literal["greeting","more","product_search","faq_or_smalltalk"]
+
+
+def classify_intent(text: str) -> Intent:
+    t = (text or "").strip().lower()
+
+    if t in _GREETINGS or any(t.startswith(g) for g in _GREETINGS):
+        return "greeting"
+
+    if (
+        t in _MORE
+        or re.fullmatch(r'(mu[ée]strame|ense[ñn]ame)\s+(m[aá]s|otros|otras)\s*\.?', t)
+    ):
+        return "more"
+
+    if _CODE_RE.search(text or "") or any(k in t for k in _KEYWORDS_SIGNAL):
+        return "product_search"
+
+    return "faq_or_smalltalk"
+
+
+def is_keyword_signal(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _KEYWORDS_SIGNAL)
+
+
+
+VALID_CATEGORIES = {
+    "driver","lamp","tubo","panel","seguridad","exterior",
+    "alumbrado_publico","interior","emergencia","solar",
+    "decorativa","industrial","accesorio",
+    "lamparas","lamparas decorativas"
+}
+
+def _map_to_category(text: str) -> str:
+    import difflib
+    text = text.lower().replace(" ", "_")
+    match = difflib.get_close_matches(text, VALID_CATEGORIES, n=1, cutoff=0.86)
+    return match[0] if match else ""
+
+def maybe_extract_slots(state: dict, user_msg: str):
+    low = (user_msg or "").lower().strip()
+
+    if low in _GREETINGS:
+        return
+
+    state["espacio_source"] = None
+
+    for alias, target in CATEGORY_MAP.items():
+        if alias in low:
+            state["espacio"] = target
+            state["espacio_source"] = "alias"
+            return
+
+    for cat in VALID_CATEGORIES:
+        if cat in low:
+            state["espacio"] = cat
+            state["espacio_source"] = "direct"
+            return
+
+    has_domain_clues = any(k in low for k in _KEYWORDS_SIGNAL)
+    if has_domain_clues and len(low) >= 6 and " " in low:
+        mapped = _map_to_category(low)
+        if mapped:
+            state["espacio"] = mapped
+            state["espacio_source"] = "fuzzy"
+
+
+
+main.py:
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from backend.routers import chat
+
+app = FastAPI(title="Ecolite Assistant", version="3.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+app.include_router(chat.router)
+app.mount("/static", StaticFiles(directory="frontend"), name="static")
+
+@app.get("/")
+def root():
+    return FileResponse("frontend/chatbox.html")
+
+
+chatbot.js
+
+const $ = s => document.querySelector(s);
+const fab = $('#cbFab'), panel = $('#cbPanel'), closeBtn = $('#cbClose');
+const stream = $('#cbStream'), input = $('#cbInput'), sendBtn = $('#cbSend');
+
+let sessionId = localStorage.getItem("ecolite_session") || (crypto?.randomUUID?.() || String(Date.now()));
+localStorage.setItem("ecolite_session", sessionId);
+
+function openPanel() {
+  panel.style.display = 'flex';
+  if (stream.childElementCount === 0) {
+    pushBot("👋 Hola, soy tu asistente de Ecolite. ¿Qué espacio quieres iluminar (oficina, piscina, bodega…)?");
+  }
+}
+function closePanel() { panel.style.display = 'none'; }
+fab.addEventListener('click', openPanel);
+closeBtn.addEventListener('click', closePanel);
+
+function el(t, c, h) { const n = document.createElement(t); if (c) n.className = c; if (h !== undefined) n.innerHTML = h; return n; }
+function push(role, html) { const row = el('div', 'msg' + (role === 'me' ? ' me' : '')); row.appendChild(el('div', 'bubble', html)); stream.appendChild(row); stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' }); }
+function pushMe(text) { push('me', text); }
+function pushBot(text) {
+  const parsed = renderProductsIfAny(text); // { html, hasProducts }
+  push('bot', parsed.html);
+
+  if (parsed.hasProducts) {
+    let ctx = '';
+    if (/piscina|ip68|sumergible/i.test(text)) ctx = 'para piscina';
+    else if (/riel|magn[eé]tico|track/i.test(text)) ctx = 'para riel magnético';
+    else if (/12v/i.test(text)) ctx = '12V';
+    else if (/24v/i.test(text)) ctx = '24V';
+    addShowMoreContext(ctx);
+  }
+}
+
+function typing(on = true) {
+  let t = $('#typing');
+  if (on && !t) { t = el('div', 'msg'); t.id = 'typing'; t.appendChild(el('div', 'bubble', 'Escribiendo…')); stream.appendChild(t); }
+  if (!on && t) { t.remove(); }
+  stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' });
+}
+
+async function sendMessage() {
+  const msg = (input.value || "").trim();
+  if (!msg) return;
+  pushMe(msg); input.value = "";
+  typing(true);
+  try {
+    const res = await fetch("/chat/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: msg, session_id: sessionId })
+    });
+    const data = await res.json();
+    typing(false);
+    pushBot(data.reply);
+  } catch (e) {
+    typing(false);
+    pushBot("⚠️ No me pude conectar, intenta de nuevo.");
+  }
+}
+sendBtn.addEventListener('click', sendMessage);
+input.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+
+function renderProductsIfAny(text) {
+  const lines = text.split('\n').map(l => l.trim().replace(/^[-•]\s*/, '')).filter(Boolean);
+  const prods = [];
+  for (const l of lines) {
+    const m = l.match(/^(.+?)\s+—\s+([$\d\.\,kK]+)\s+—\s+(https?:\/\/\S+)\s+—\s*(\S+)?$/);
+    if (m) { prods.push({ name: m[1], price: m[2], url: m[3], img_url: m[4] || '' }); }
+  }
+  if (!prods.length) return { html: text, hasProducts: false };
+
+  const html = `
+    <div class="prod-inline">
+      ${prods.map(p => `
+        <div class="prod-item">
+          <img src="${p.img_url || 'https://dummyimage.com/120x120/0b1325/ffffff&text=LED'}" alt="${p.name}">
+          <div class="prod-info">
+            <div class="prod-name">${p.name}</div>
+            <div class="prod-price">${p.price}</div>
+            <a class="prod-link" href="${p.url}" target="_blank" rel="noopener">Ver producto</a>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+  return { html, hasProducts: true };
+}
+
+function addShowMoreContext(ctxText) {
+  const tpl = document.getElementById('tplShowMore');
+  let node, btn;
+  if (tpl && 'content' in tpl) {
+    node = tpl.content.cloneNode(true);
+    btn = node.querySelector('.cb-cta');
+  } else {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg';
+    wrap.innerHTML = `<div class="bubble"><button class="cb-cta" type="button">Ver más</button></div>`;
+    node = wrap;
+    btn = wrap.querySelector('.cb-cta');
+  }
+  btn.dataset.context = (ctxText || '').trim();
+  btn.addEventListener('click', () => {
+    const extra = btn.dataset.context ? ` ${btn.dataset.context}` : '';
+    input.value = `muestrame otras${extra}`;
+    sendMessage();
+  });
+  if (node instanceof DocumentFragment) stream.appendChild(node); else stream.appendChild(node);
+  stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' });
+}
+
+
+chatbot.html
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Asistente de Ecolite</title>
+  <link rel="stylesheet" href="/static/chatbox.css">
+</head>
+<body>
+  <button class="cb-fab" id="cbFab" aria-label="Abrir chat">
+    <span class="pulse"></span><span>¿Necesitas ayuda?</span>
+  </button>
+
+  <section class="cb-panel" id="cbPanel" role="dialog" aria-label="Asistente de Ecolite">
+    <header class="cb-header">
+      <div class="cb-logo"></div>
+      <div>
+        <p class="cb-title">Asistente de Ecolite</p>
+        <p class="cb-sub">Atención rápida y personalizada</p>
+      </div>
+      <button id="cbClose" class="cb-close">✕</button>
+    </header>
+
+    <div class="cb-body">
+      <div class="cb-stream" id="cbStream"></div>
+      <footer class="cb-footer">
+        <input id="cbInput" class="cb-input" placeholder="Escribe tu mensaje…"/>
+        <button id="cbSend" class="cb-send">Enviar</button>
+      </footer>
+    </div>
+  </section>
+
+  <!-- Template del botón “Ver más” -->
+  <template id="tplShowMore">
+    <div class="msg">
+      <div class="bubble">
+        <button class="cb-cta" type="button" aria-label="Ver más resultados" data-context="">
+          Ver más
+        </button>
+      </div>
+    </div>
+  </template>
+
+  <script src="/static/chatbox.js"></script>
+</body>
+</html>
+
+
+chatbot.css:
+
+/* =========================
+   Tema CLARO – Ecolite Chat
+   ========================= */
+:root {
+    /* Paleta clara */
+    --brand: #2563eb;
+    /* Azul principal */
+    --brand-600: #1d4ed8;
+    --brand-50: #eff6ff;
+    --bg: #f8fafc;
+    /* Fondo página */
+    --panel: #ffffff;
+    /* Paneles / burbujas */
+    --line: #e5e7eb;
+    /* Bordes suaves */
+    --text: #0f172a;
+    /* Texto principal */
+    --muted: #6b7280;
+    /* Texto secundario */
+    --success: #10b981;
+
+    /* Elevación y radios */
+    --radius-lg: 18px;
+    --radius-md: 12px;
+    --radius-sm: 10px;
+    --shadow-1: 0 6px 18px rgba(2, 6, 23, .06);
+    --shadow-2: 0 14px 34px rgba(2, 6, 23, .10);
+}
+
+/* Reset básico */
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    margin: 0;
+    font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+    background: linear-gradient(180deg, #f9fbff 0%, var(--bg) 40%, #f5f7fb 100%);
+    color: var(--text);
+}
+
+/* =========================
+   FAB (botón flotante)
+   ========================= */
+.cb-fab {
+    position: fixed;
+    right: 22px;
+    bottom: 26px;
+    display: flex;
+    gap: .6rem;
+    align-items: center;
+    padding: 12px 14px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--brand), var(--brand-600));
+    color: #fff;
+    border: 1px solid rgba(255, 255, 255, .6);
+    box-shadow: var(--shadow-2);
+    cursor: pointer;
+    z-index: 10;
+    transition: transform .12s ease, box-shadow .12s ease;
+}
+
+.cb-fab:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 18px 46px rgba(29, 78, 216, .22);
+}
+
+.cb-fab .pulse {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background: var(--success);
+    box-shadow: 0 0 0 6px rgba(16, 185, 129, .20);
+}
+
+/* =========================
+   Panel de chat
+   ========================= */
+.cb-panel {
+    position: fixed;
+    right: 22px;
+    bottom: 92px;
+    width: 390px;
+    max-width: 96vw;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-2);
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 20;
+}
+
+/* Header */
+.cb-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    background: linear-gradient(180deg, var(--brand-50), #ffffff);
+    border-bottom: 1px solid var(--line);
+}
+
+.cb-logo {
+    width: 32px;
+    height: 32px;
+    border-radius: 10px;
+    background: var(--brand);
+    box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .5), 0 6px 16px rgba(37, 99, 235, .25);
+}
+
+.cb-title {
+    margin: 0;
+    font-weight: 800;
+    font-size: 14px;
+    color: #0b1220;
+    letter-spacing: .1px;
+}
+
+.cb-sub {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.cb-close {
+    margin-left: auto;
+    background: #fff;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    cursor: pointer;
+    width: 30px;
+    height: 30px;
+    border-radius: 10px;
+    display: grid;
+    place-items: center;
+    transition: background .12s ease, color .12s ease;
+}
+
+.cb-close:hover {
+    background: #f3f4f6;
+    color: #111827;
+}
+
+/* Cuerpo */
+.cb-body {
+    display: flex;
+    flex-direction: column;
+    height: 520px;
+    max-height: 70vh;
+}
+
+.cb-stream {
+    flex: 1;
+    overflow: auto;
+    padding: 14px;
+    background: linear-gradient(180deg, #fff, #fafbff);
+}
+
+/* Footer (input) */
+.cb-footer {
+    border-top: 1px solid var(--line);
+    padding: 10px;
+    background: #fff;
+    display: flex;
+    gap: 8px;
+}
+
+.cb-input {
+    flex: 1;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: #fff;
+    color: var(--text);
+    outline: none;
+    transition: border-color .12s ease, box-shadow .12s ease;
+}
+
+.cb-input:focus {
+    border-color: var(--brand);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, .15);
+}
+
+.cb-send {
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--brand);
+    background: linear-gradient(180deg, var(--brand), var(--brand-600));
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform .12s ease, box-shadow .12s ease;
+}
+
+.cb-send:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 26px rgba(29, 78, 216, .24);
+}
+
+/* =========================
+   Mensajes
+   ========================= */
+.msg {
+    display: flex;
+    margin: 10px 0;
+    gap: 8px;
+    align-items: flex-end;
+    padding: 0 4px;
+}
+
+.msg .bubble {
+    max-width: 78%;
+    padding: 11px 13px;
+    border-radius: 14px;
+    border: 1px solid var(--line);
+    background: #ffffff;
+    box-shadow: var(--shadow-1);
+    line-height: 1.4;
+}
+
+.msg.me {
+    justify-content: flex-end;
+}
+
+.msg.me .bubble {
+    background: linear-gradient(180deg, var(--brand-50), #fff);
+    border-color: #dbeafe;
+    box-shadow: 0 8px 24px rgba(37, 99, 235, .12);
+}
+
+/* “Escribiendo…” */
+#typing .bubble {
+    color: var(--muted);
+    font-style: italic;
+}
+
+/* =========================
+   Cards de productos
+   ========================= */
+.prod-inline {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 10px 4px 4px;
+}
+
+.prod-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: #ffffff;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 10px;
+    box-shadow: var(--shadow-1);
+    transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+}
+
+.prod-item:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 28px rgba(2, 6, 23, .12);
+    border-color: #d1d5db;
+}
+
+.prod-item img {
+    width: 80px;
+    height: 80px;
+    object-fit: contain;
+    background: #f3f6fb;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+}
+
+.prod-info {
+    display: grid;
+    gap: 4px;
+}
+
+.prod-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: #111827;
+}
+
+.prod-price {
+    font-size: 13px;
+    font-weight: 800;
+    color: var(--success);
+}
+
+.prod-link {
+    width: max-content;
+    margin-top: 2px;
+    font-size: 12.5px;
+    text-decoration: none;
+    color: #1d4ed8;
+    border: 1px solid #dbeafe;
+    background: #eff6ff;
+    padding: 6px 10px;
+    border-radius: 999px;
+    transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+
+.prod-link:hover {
+    background: #dbeafe;
+    border-color: #bfdbfe;
+    color: #1e40af;
+}
+
+/* CTA “Ver más” */
+.cb-cta {
+    padding: 10px 14px;
+    border-radius: 999px;
+    border: 1px solid #dbeafe;
+    background: #eff6ff;
+    color: #1e40af;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform .12s ease, box-shadow .12s ease, background .12s ease;
+}
+
+.cb-cta:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 20px rgba(29, 78, 216, .12);
+    background: #e0efff;
+}
+
+.cb-cta:focus {
+    outline: 3px solid rgba(37, 99, 235, .18);
+    outline-offset: 2px;
+}
+
+/* =========================
+   Responsivo
+   ========================= */
+@media (max-width:480px) {
+    .cb-panel {
+        right: 50%;
+        transform: translateX(50%);
+        width: 96vw;
+        bottom: 90px;
+    }
+
+    .msg .bubble {
+        max-width: 86%;
+    }
+
+    .prod-item {
+        align-items: flex-start;
+    }
+}
+
+
+productos.json:
+
 {
   "VING125-C": {
     "code": "VING125-C",

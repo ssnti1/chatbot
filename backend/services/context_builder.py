@@ -1,3 +1,4 @@
+# backend/services/context_builder.py
 import json
 
 BASE_RULES = """
@@ -11,13 +12,9 @@ REGLAS:
 - Si faltan datos (espacio, instalación, vatios, temperatura, presupuesto), haz 1 pregunta concreta.
 - Formato ESTRICTO de cada producto (una línea por ítem, sin markdown, sin viñetas):
   Nombre — Precio — URL — IMG_URL
-- No digas parce, parcero ni palabras groseras, tampoco des información que no sea de la empresa (ej: "qué tal el clima", "cuanto vale un ferrari") evita cualquier tema no relacionado a la tematica de la empresa (Ecolite) el cuál eres el asistente.
-
-EJEMPLO VÁLIDO:
-Luminaria colgante y de sobreponer 48W LEDLC3B — $240.800 — https://ecolite.com.co/producto/luminaria-sobreponer-y-colgante-48w-ledlc3b/ — https://ecolite.com.co/wp-content/uploads/2025/08/LEDLC3B-B.webp
 """
 
-def build_context(user_message: str, state: dict, candidates: list[dict]) -> str:
+def build_context(state: dict, candidates: list[dict]) -> str:
     state_snapshot = {
         "espacio": state.get("espacio"),
         "necesidad": state.get("necesidad"),
