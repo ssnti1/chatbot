@@ -35,7 +35,7 @@ def norm_txt(s: str) -> str:
 
 def tok(s: str) -> List[str]:
     s = norm_txt(s)
-    # Separa números (3000k, 12v) y palabras (ip65) de forma segura
+    # separa 3000k / ip65 / 12v de forma robusta
     s = re.sub(r"([0-9]+)([a-z]+)", r"\1 \2", s)
     s = re.sub(r"([a-z]+)([0-9]+)", r"\1 \2", s)
     parts = re.split(r"[^a-z0-9]+", s)
@@ -44,7 +44,6 @@ def tok(s: str) -> List[str]:
 def url_slug_tokens(url: str | None) -> List[str]:
     if not url:
         return []
-    # Extrae segmentos de la URL y separa por guiones
     try:
         path = re.sub(r"^https?://[^/]+", "", url or "")
         segs = [seg for seg in path.split("/") if seg]
@@ -69,20 +68,23 @@ def _resolve_path() -> Path:
         if p.exists():
             DATA_PATH = p
             return DATA_PATH
-    # Por último, intenta junto al módulo (útil en dev)
+    # último intento: junto al módulo (útil en dev)
     fallback = Path(__file__).parent / "productos.json"
     if fallback.exists():
         DATA_PATH = fallback
         return DATA_PATH
-    raise FileNotFoundError("No se encontró productos.json. Configure ECOLITE_PRODUCTS_PATH o coloque el archivo en backend/data/ o en la raíz del repo.")
+    raise FileNotFoundError(
+        "No se encontró productos.json. Configure ECOLITE_PRODUCTS_PATH o "
+        "coloque el archivo en backend/data/ o en la raíz del repo."
+    )
 
 def _postprocess_record(rec: dict) -> dict:
     """
     Enriquecemos cada producto con campos normalizados SIN imponer categorías estáticas.
-    - name_norm: texto normalizado del nombre
-    - categories_norm / tags_norm: normalizados (si existen)
-    - slug_toks: tokens extraídos de la URL de categoría (si hay)
-    - blob: gran campo indexable con todo lo anterior
+    - name_norm / code_norm
+    - categories_norm / tags_norm
+    - slug_toks a partir de la URL (si existe)
+    - search_blob con todo para indexado global
     """
     name = rec.get("name") or ""
     code = rec.get("code") or ""
@@ -104,14 +106,12 @@ def _postprocess_record(rec: dict) -> dict:
     if slug_toks:
         blob_parts.append(" ".join(slug_toks))
 
-    blob = " ".join([p for p in blob_parts if p]).strip()
-
     rec["name_norm"] = name_norm
     rec["code_norm"] = code_norm
     rec["categories_norm"] = cats_norm
     rec["tags_norm"] = tags_norm
     rec["slug_toks"] = slug_toks
-    rec["search_blob"] = blob
+    rec["search_blob"] = " ".join([p for p in blob_parts if p]).strip()
     return rec
 
 def _load_from_disk() -> Dict[str, dict]:
@@ -119,14 +119,23 @@ def _load_from_disk() -> Dict[str, dict]:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    # admite tanto dict plano {CODE: {...}} como lista [{code:,...}]
+    data: Dict[str, Any]
+    if isinstance(raw, list):
+        data = {str(it.get("code") or it.get("sku") or f"ITEM{i}"): it for i, it in enumerate(raw)}
+    else:
+        data = dict(raw)
+
     out: Dict[str, dict] = {}
-    for code, rec in raw.items():
+    for code, rec in data.items():
         if not isinstance(rec, dict):
             continue
         rec = {**rec}
         rec.setdefault("code", code)
         out[code] = _postprocess_record(rec)
 
+    if not out:
+        raise RuntimeError("El catálogo cargó vacío.")
     return out
 
 def load_products() -> Tuple[Dict[str, dict], Path]:

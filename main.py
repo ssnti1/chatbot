@@ -1,10 +1,11 @@
+# main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.routers import chat
 
-app = FastAPI(title="Ecolite Assistant", version="3.1")
+app = FastAPI(title="Ecolite Assistant", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,3 +21,7 @@ app.mount("/static", StaticFiles(directory="frontend"), name="static")
 @app.get("/")
 def root():
     return FileResponse("frontend/chatbox.html")
+
+@app.get("/healthz")
+def health():
+    return {"ok": True}

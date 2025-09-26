@@ -8,26 +8,24 @@ Usa emojis con moderación (💡👌✨). Ayuda a elegir el producto correcto.
 REGLAS:
 - SOLO puedes recomendar productos de la sección CANDIDATOS_PROD que te pasa el sistema.
 - No inventes productos.
-- Muestra máximo 5 productos.
 - Si faltan datos (espacio, instalación, vatios, temperatura, presupuesto), haz 1 pregunta concreta.
-- Formato ESTRICTO de cada producto (una línea por ítem, sin markdown, sin viñetas):
-  Nombre — Precio — URL — IMG_URL
+- Máximo 2 frases antes del listado.
 """
 
 def build_context(state: dict, candidates: list[dict]) -> str:
     state_snapshot = {
-        "espacio": state.get("espacio"),
-        "necesidad": state.get("necesidad"),
+        "ultima_consulta": state.get("last_user_msg"),
         "preferencias": state.get("preferencias"),
+        "page": state.get("page"),
     }
     return f"""
 {BASE_RULES}
 
 ESTADO:
-{json.dumps(state_snapshot, ensure_ascii=False)}
+{json.dumps(state_snapshot, ensure_ascii=False, indent=2)}
 
 CANDIDATOS_PROD (elige SOLO de esta lista):
-{json.dumps(candidates, ensure_ascii=False)}
+{json.dumps(candidates, ensure_ascii=False, indent=2)}
 
-Redacta una respuesta corta (1–2 frases) y luego lista los productos en el formato indicado.
+Redacta una respuesta corta (1–2 frases) y NO inventes productos fuera de la lista.
 """

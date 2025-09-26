@@ -7,7 +7,6 @@ import random
 import unicodedata
 
 from backend.services.product_loader import load_products, PRODUCTOS
-from backend.services.openai_client import ask_chatgpt
 
 # =====================================================
 # Normalización y tokenización (100% data-driven)
@@ -57,7 +56,7 @@ def _ensure_index():
     _VOCAB.clear()
     _ALL_CATEGORY_TERMS.clear()
 
-    # construir índice a partir del blob de product_loader
+    # construir índice a partir del blob del loader
     for code, p in PRODUCTOS.items():
         name = set(_tok(p.get("name_norm") or p.get("name") or ""))
         tags = set(_tok(" ".join(p.get("tags_norm") or p.get("tags") or [])))
@@ -65,7 +64,6 @@ def _ensure_index():
         slug = set(p.get("slug_toks") or [])
         codef = set(_tok(p.get("code") or ""))
 
-        # blob amplia: lo que exista
         blob = set(_tok(" ".join([
             p.get("search_blob") or "",
             p.get("name_norm") or "",
@@ -84,15 +82,10 @@ def _ensure_index():
 
         _ALL_CATEGORY_TERMS |= cats
 
-    # IDF suave para scoring TF-IDF-like
     N = max(1, len(_INDEX))
-    _IDF = {t: math.log((N + 1) / (df + 0.5)) + 1.0 for t, df in _VOCAB.items()}
-
+    _IDF.update({t: math.log((N + 1) / (df + 0.5)) + 1.0 for t, df in _VOCAB.items()})
     _INDEX_READY = True
 
-# =====================================================
-# Utilidades
-# =====================================================
 def _idf(t: str) -> float:
     return _IDF.get(t, 0.5)
 
@@ -106,69 +99,29 @@ def _char_sim(a: str, b: str) -> float:
         return 0.0
     return len(A & B) / len(A | B)
 
-# =====================================================
-# Expansión de consulta 100% data-driven
-#   - Fallback sin LLM: tokens del vocab más parecidos por n-gramas
-#   - Con LLM: pide SOLO tokens del vocab (no sinónimos inventados)
-# =====================================================
-def _expand_query_tokens(q_toks: List[str], k_llm: int = 8, k_fallback: int = 6) -> List[str]:
+def _expand_query_tokens(q_toks: List[str], k_fallback: int = 6) -> List[str]:
     _ensure_index()
     base = [t for t in q_toks if t not in _STOPWORDS_ES]
     if not base:
         return []
-
-    # Candidatos por similitud de caracteres a cada término
     cand: Dict[str, float] = {}
     for t in base:
         for v in _VOCAB.keys():
             sim = _char_sim(t, v)
             if sim >= 0.35:
                 cand[v] = max(cand.get(v, 0.0), sim)
+    return sorted(cand.keys(), key=lambda x: (-cand[x], -_idf(x)))[:k_fallback]
 
-    # Si no hay API key, devolvemos top-k por similitud
-    # (sin estáticos, todo sale del vocabulario del catálogo)
-    from backend.services.openai_client import OPENAI_API_KEY
-    if not OPENAI_API_KEY:
-        return sorted(cand.keys(), key=lambda x: (-cand[x], -_idf(x)))[:k_fallback]
-
-    # Con LLM: recorta candidatos y pide mapeo a tokens del vocab
-    short_list = sorted(cand.keys(), key=lambda x: (-cand[x], -_idf(x)))[:50] or list(_VOCAB.keys())[:200]
-    sys_prompt = (
-        "Eres un indexador. Te doy un MENSAJE de usuario y una LISTA DE TOKENS del catálogo.\n"
-        "Devuélveme entre 3 y 8 tokens de la LISTA que mejor ayuden a encontrar productos.\n"
-        "Responde SOLO tokens separados por comas. No inventes tokens que no estén en la lista."
-    )
-    user_msg = f"MENSAJE: {' '.join(base)}\nTOKENS: {', '.join(short_list)}"
-    try:
-        out = ask_chatgpt(sys_prompt, user_msg)
-        picks = [t.strip().lower() for t in (out or "").split(",")]
-        picks = [t for t in picks if t in _VOCAB]
-        return picks[:k_llm]
-    except Exception:
-        return sorted(cand.keys(), key=lambda x: (-cand[x], -_idf(x)))[:k_fallback]
-
-# =====================================================
-# Scoring por campos + TF-IDF, sin reglas por categoría
-# =====================================================
 def _score_product(code: str, q_toks: List[str], expand: List[str]) -> float:
     f = _INDEX[code]
     name, tags, cats, slug, codef, blob = f["name"], f["tags"], f["cats"], f["slug"], f["code"], f["blob"]
 
-    # consulta efectiva: originales + expansión
     q = [t for t in q_toks if t not in _STOPWORDS_ES]
     q = list(dict.fromkeys(q + [e for e in expand if e not in q]))  # unique, preserve order
     if not q:
         return 0.0
 
-    # TF-IDF approximado por campo
     def field_match(field: Set[str]) -> float:
-        # exacta o substring (e.g., "piscina" no existirá; pero expansión puede incluir "sumergible")
-        exact = sum(1 for t in q if t in field)
-        sub = 0
-        for t in q:
-            if any(t in ft or ft in t for ft in field):
-                sub += 1
-        # peso por rareza
         score = 0.0
         for t in q:
             if t in field:
@@ -176,6 +129,11 @@ def _score_product(code: str, q_toks: List[str], expand: List[str]) -> float:
             elif any(t in ft or ft in t for ft in field):
                 score += _idf(t) * 0.5
         # pequeño premio por múltiples coincidencias
+        exact = sum(1 for t in q if t in field)
+        sub = 0
+        for t in q:
+            if any(t in ft or ft in t for ft in field):
+                sub += 1
         return score + 0.15 * (exact + sub)
 
     s_name = field_match(name)
@@ -185,26 +143,21 @@ def _score_product(code: str, q_toks: List[str], expand: List[str]) -> float:
     s_code = field_match(codef)
     s_blob = field_match(blob) * 0.6
 
-    # Ponderación suave; nada estático dependiente de dominio
-    score = (1.6 * s_name) + (1.0 * s_cats) + (0.9 * s_slug) + (0.7 * s_tags) + (0.5 * s_code) + (1.2 * s_blob)
-
-    return score
+    return (1.6 * s_name) + (1.0 * s_cats) + (0.9 * s_slug) + (0.7 * s_tags) + (0.5 * s_code) + (1.2 * s_blob)
 
 def _paginate(items: List[Dict], limit: int, offset: int, exclude_codes: Set[str] | None = None) -> List[Dict]:
     exclude_codes = exclude_codes or set()
     out = [it for it in items if it["code"] not in exclude_codes]
     return out[offset: offset + limit]
 
-# API principal
 def search_candidates(user_msg: str, state: dict, limit: int = 5, offset: int = 0, exclude_codes: List[str] | None = None) -> List[Dict]:
     _ensure_index()
     text = _norm(user_msg)
     q_toks = _tok(text)
-    # Sin términos útiles => no devolvemos productos (evita mostrar cosas con "hola")
+    # Sin términos útiles => no devolvemos productos
     if not [t for t in q_toks if t not in _STOPWORDS_ES]:
         return []
 
-    # expansión (data-driven)
     expand = _expand_query_tokens(q_toks)
 
     rng = random.Random(state.get("result_seed") or 0)
@@ -220,17 +173,13 @@ def search_candidates(user_msg: str, state: dict, limit: int = 5, offset: int = 
             "url": p.get("url"),
             "img_url": p.get("img_url"),
         }
-        # ligero jitter para desempatar de forma estable por semilla
-        jitter = rng.random() * 0.01
+        jitter = rng.random() * 0.01  # desempate estable
         scored.append((score + jitter, payload))
 
     scored.sort(key=lambda x: (-x[0], x[1]["code"]))
     flattened = [it for _, it in scored]
     return _paginate(flattened, limit=limit, offset=offset, exclude_codes=set(exclude_codes or []))
 
-# =====================================================
-# Utilidad opcional: “detectar” términos tipo categoría 100% por dato
-# =====================================================
 def _detect_categories_from_text(user_msg: str) -> List[str]:
     _ensure_index()
     msg = _norm(user_msg)
