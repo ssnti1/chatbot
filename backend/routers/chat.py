@@ -2,7 +2,7 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import Optional, List, Dict
 import hashlib
 
 from backend.services.search_service import search_candidates
@@ -33,11 +33,10 @@ def chat(in_: ChatIn):
     page = max(0, int(in_.page or 0))
     effective_query = in_.last_query if page > 0 and in_.last_query else msg
 
-    # Estado efímero para el motor (no persiste)
     state = {
         "page": page,
         "result_seed": _stable_seed(in_.session_id, effective_query),
-        "preferencias": {},  # si luego parseas vatios/temp/etc puedes pasarlo aquí
+        "preferencias": {},
         "last_user_msg": effective_query,
     }
 
@@ -45,7 +44,6 @@ def chat(in_: ChatIn):
     offset = page * limit
     cand = search_candidates(effective_query, state, limit=limit, offset=offset, exclude_codes=[])
 
-    # Redacción breve (si no hay OPENAI_API_KEY, el stub devuelve un texto seguro)
     system_prompt = build_context(state, cand)
     reply = ask_chatgpt(system_prompt)
 

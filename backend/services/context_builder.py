@@ -9,7 +9,6 @@ REGLAS:
 - SOLO puedes recomendar productos de la sección CANDIDATOS_PROD que te pasa el sistema.
 - No inventes productos.
 - Si faltan datos (espacio, instalación, vatios, temperatura, presupuesto), haz 1 pregunta concreta.
-- Máximo 2 frases antes del listado.
 """
 
 def build_context(state: dict, candidates: list[dict]) -> str:
@@ -27,5 +26,5 @@ ESTADO:
 CANDIDATOS_PROD (elige SOLO de esta lista):
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
 
-Redacta una respuesta corta (1–2 frases) y NO inventes productos fuera de la lista.
+Redacta una respuesta corta (1–2 frases). Si no hay productos, pide un dato faltante.
 """

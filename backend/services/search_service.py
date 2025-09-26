@@ -1,16 +1,9 @@
 # backend/services/search_service.py
 from __future__ import annotations
+import re, unicodedata, random, math
 from typing import List, Dict, Tuple, Set
-import re
-import math
-import random
-import unicodedata
-
 from backend.services.product_loader import load_products, PRODUCTOS
 
-# =====================================================
-# Normalización y tokenización (100% data-driven)
-# =====================================================
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c) != "Mn")
 
@@ -22,7 +15,6 @@ def _norm(s: str) -> str:
 
 def _tok(s: str) -> List[str]:
     s = _norm(s)
-    # separa "3000k", "ip65", "12v" de forma robusta
     s = re.sub(r"([0-9]+)([a-z]+)", r"\1 \2", s)
     s = re.sub(r"([a-z]+)([0-9]+)", r"\1 \2", s)
     toks = re.split(r"[^a-z0-9]+", s)
@@ -36,13 +28,10 @@ _STOPWORDS_ES: Set[str] = {
     "hola","buenas","buenos","dias","días","tardes","noches","quiero","necesito"
 }
 
-# =====================================================
-# Índice derivado del catálogo (sin listas estáticas)
-# =====================================================
 _INDEX_READY = False
-_INDEX: Dict[str, Dict[str, Set[str]]] = {}   # code -> {name,tags,cats,slug,code,blob}
-_VOCAB: Dict[str, int] = {}                    # token -> DF (doc frequency)
-_IDF: Dict[str, float] = {}                    # token -> idf
+_INDEX: Dict[str, Dict[str, Set[str]]] = {}
+_VOCAB: Dict[str, int] = {}
+_IDF: Dict[str, float] = {}
 _ALL_CATEGORY_TERMS: Set[str] = set()
 
 def _ensure_index():
@@ -52,18 +41,14 @@ def _ensure_index():
     if not PRODUCTOS:
         load_products()
 
-    _INDEX.clear()
-    _VOCAB.clear()
-    _ALL_CATEGORY_TERMS.clear()
+    _INDEX.clear(); _VOCAB.clear(); _ALL_CATEGORY_TERMS.clear()
 
-    # construir índice a partir del blob del loader
     for code, p in PRODUCTOS.items():
         name = set(_tok(p.get("name_norm") or p.get("name") or ""))
         tags = set(_tok(" ".join(p.get("tags_norm") or p.get("tags") or [])))
         cats = set(_tok(" ".join(p.get("categories_norm") or p.get("categories") or [])))
         slug = set(p.get("slug_toks") or [])
         codef = set(_tok(p.get("code") or ""))
-
         blob = set(_tok(" ".join([
             p.get("search_blob") or "",
             p.get("name_norm") or "",
@@ -73,13 +58,9 @@ def _ensure_index():
             p.get("code") or "",
         ])))
 
-        _INDEX[code] = {
-            "name": name, "tags": tags, "cats": cats, "slug": slug, "code": codef, "blob": blob
-        }
-
+        _INDEX[code] = {"name": name, "tags": tags, "cats": cats, "slug": slug, "code": codef, "blob": blob}
         for t in set().union(name, tags, cats, slug, codef, blob):
             _VOCAB[t] = _VOCAB.get(t, 0) + 1
-
         _ALL_CATEGORY_TERMS |= cats
 
     N = max(1, len(_INDEX))
@@ -115,9 +96,8 @@ def _expand_query_tokens(q_toks: List[str], k_fallback: int = 6) -> List[str]:
 def _score_product(code: str, q_toks: List[str], expand: List[str]) -> float:
     f = _INDEX[code]
     name, tags, cats, slug, codef, blob = f["name"], f["tags"], f["cats"], f["slug"], f["code"], f["blob"]
-
     q = [t for t in q_toks if t not in _STOPWORDS_ES]
-    q = list(dict.fromkeys(q + [e for e in expand if e not in q]))  # unique, preserve order
+    q = list(dict.fromkeys(q + [e for e in expand if e not in q]))
     if not q:
         return 0.0
 
@@ -128,7 +108,6 @@ def _score_product(code: str, q_toks: List[str], expand: List[str]) -> float:
                 score += _idf(t) * 1.0
             elif any(t in ft or ft in t for ft in field):
                 score += _idf(t) * 0.5
-        # pequeño premio por múltiples coincidencias
         exact = sum(1 for t in q if t in field)
         sub = 0
         for t in q:
@@ -154,26 +133,19 @@ def search_candidates(user_msg: str, state: dict, limit: int = 5, offset: int = 
     _ensure_index()
     text = _norm(user_msg)
     q_toks = _tok(text)
-    # Sin términos útiles => no devolvemos productos
     if not [t for t in q_toks if t not in _STOPWORDS_ES]:
         return []
 
     expand = _expand_query_tokens(q_toks)
-
     rng = random.Random(state.get("result_seed") or 0)
+
     scored: List[Tuple[float, Dict]] = []
     for code, p in PRODUCTOS.items():
         score = _score_product(code, q_toks, expand)
         if score <= 0:
             continue
-        payload = {
-            "code": code,
-            "name": p.get("name"),
-            "price": p.get("price"),
-            "url": p.get("url"),
-            "img_url": p.get("img_url"),
-        }
-        jitter = rng.random() * 0.01  # desempate estable
+        payload = {"code": code, "name": p.get("name"), "price": p.get("price"), "url": p.get("url"), "img_url": p.get("img_url")}
+        jitter = rng.random() * 0.01
         scored.append((score + jitter, payload))
 
     scored.sort(key=lambda x: (-x[0], x[1]["code"]))

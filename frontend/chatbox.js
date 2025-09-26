@@ -7,7 +7,7 @@ const stream = $('#cbStream'), input = $('#cbInput'), sendBtn = $('#cbSend');
 let sessionId = localStorage.getItem("ecolite_session") || (crypto?.randomUUID?.() || String(Date.now()));
 localStorage.setItem("ecolite_session", sessionId);
 
-// Paginación en cliente
+// Paginación 100% en cliente (server stateless)
 let lastQuery = "";
 let page = 0;
 const PAGE_SIZE = 5;
@@ -28,7 +28,12 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;'
 function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
 function linkify(text) { return text.replace(/(https?:\/\/[^\s)]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>'); }
 
-function push(role, html) { const row = el('div', 'msg' + (role === 'me' ? ' me' : '')); row.appendChild(el('div', 'bubble', html)); stream.appendChild(row); stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' }); }
+function push(role, html) {
+  const row = el('div', 'msg' + (role === 'me' ? ' me' : ''));
+  row.appendChild(el('div', 'bubble', html));
+  stream.appendChild(row);
+  stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' });
+}
 function pushMe(text) { push('me', escapeHtml(text)); }
 
 function renderProducts(items) {
@@ -106,36 +111,37 @@ async function sendMessage(raw, isShowMore = false) {
   input.value = "";
   typing(true);
 
-  try {
-    const res = await fetch("/chat/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: sessionId,
-        message: effectiveQuery,
-        last_query: lastQuery,
-        page
-      })
-    });
+    try {
+      const res = await fetch("/chat/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, message: effectiveQuery, last_query: lastQuery, page })
+      });
 
-    if (!res.ok) {
+      // Lee cuerpo como texto primero (para mensajes de error no-JSON)
+      const raw = await res.text();
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : null; } catch { /* no JSON */ }
+
+      if (!res.ok) {
+        typing(false);
+        const detail = (data && (data.detail || data.error || data.message)) || raw || "";
+        console.error("Error /chat/:", res.status, detail);
+        pushBot(`⚠️ Error del servidor (${res.status}). ${detail ? "Detalle: " + escapeHtml(String(detail)).slice(0, 240) : "Intenta de nuevo."}`);
+        return;
+      }
+
       typing(false);
-      pushBot(`⚠️ Error del servidor (${res.status}). Intenta de nuevo.`);
-      return;
+      const text = (data && (data.content || data.reply)) || "Aquí tienes algunas opciones recomendadas:";
+      const products = Array.isArray(data?.products) ? data.products : [];
+      pushBot(text, products);
+
+    } catch (e) {
+      typing(false);
+      console.error("Network error /chat/:", e);
+      pushBot("⚠️ No me pude conectar, intenta de nuevo.");
     }
-
-    const data = await res.json();
-    typing(false);
-
-    const text = (data && (data.content || data.reply)) || "Aquí tienes algunas opciones recomendadas:";
-    const products = Array.isArray(data?.products) ? data.products : [];
-    pushBot(text, products);
-
-  } catch (e) {
-    typing(false);
-    pushBot("⚠️ No me pude conectar, intenta de nuevo.");
   }
-}
 
 sendBtn.addEventListener('click', () => sendMessage());
 input.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
